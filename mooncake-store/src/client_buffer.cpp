@@ -27,7 +27,7 @@ std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
 ClientBufferAllocator::ClientBufferAllocator(size_t size,
                                              const std::string& protocol,
                                              bool use_hugepage)
-    : protocol(protocol), buffer_size_(size), use_hugepage_(use_hugepage) {
+    : protocol(protocol), use_hugepage_(use_hugepage), buffer_size_(size) {
     if (size == 0) {
         buffer_ = nullptr;
         allocator_ = nullptr;

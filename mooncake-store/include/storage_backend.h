@@ -4,11 +4,13 @@
 
 #include <atomic>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "file_interface.h"
@@ -155,7 +157,7 @@ struct OffloadMetadata {
 
 enum class FileMode { Read, Write };
 
-enum class StorageBackendType { kFilePerKey, kBucket, kOffsetAllocator };
+enum class StorageBackendType { kFilePerKey, kBucket, kOffsetAllocator, kDistributedKV };
 
 static constexpr size_t kKB = 1024;
 static constexpr size_t kMB = kKB * 1024;
@@ -1218,6 +1220,88 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     // Test-only: Predicate to determine which keys should fail in BatchOffload.
     // Used for deterministic testing of partial success behavior.
     std::function<bool(const std::string& key)> test_failure_predicate_;
+};
+  
+// ─────────────────────────────────────────────────────────────────────────────  
+// IDistributedKVClient — 用户实现的分布式 KV 后端接口  
+// ─────────────────────────────────────────────────────────────────────────────  
+class IDistributedKVClient {  
+   public:  
+    virtual ~IDistributedKVClient() = default;  
+  
+    // 初始化连接  
+    virtual ErrorCode Init() = 0;  
+  
+    // 批量写入：keys[i] 对应 values[i]（已拼接好的字节串）  
+    virtual tl::expected<std::vector<int>, ErrorCode> BatchPut(const std::vector<std::string>& keys,
+                               const std::vector<std::string>& values) = 0;  
+  
+    // 批量读取：将 key 对应的数据读入 dest_slices[key].ptr  
+    // dest_slices[key].size 是预分配的缓冲区大小，必须与实际数据大小匹配  
+    virtual ErrorCode BatchGet(  
+        const std::vector<std::string>& keys,  
+        std::unordered_map<std::string, Slice>& dest_slices) = 0;  
+  
+    // 检查 key 是否存在  
+    virtual tl::expected<bool, ErrorCode> Exists(const std::string& key) = 0;  
+  
+    // 扫描所有 key，用于进程重启后恢复 master 元数据（ScanMeta）  
+    virtual ErrorCode ScanKeys(  
+        const std::function<ErrorCode(const std::string& key,  
+                                      int64_t value_size)>& handler) = 0;  
+};
+
+// 实现 IDistributedKVClient（封装KVC接口）  
+class UbsKVClient : public IDistributedKVClient {  
+public:  
+    ErrorCode Init() override;
+    tl::expected<std::vector<int>, ErrorCode> BatchPut(const std::vector<std::string>& keys,  
+                                 const std::vector<std::string>& values) override;
+    ErrorCode BatchGet(const std::vector<std::string>& keys,  
+                                 std::unordered_map<std::string, Slice>& dest) override;
+    tl::expected<bool, ErrorCode> Exists(const std::string& key) override;
+    ErrorCode ScanKeys(  
+        const std::function<ErrorCode(const std::string&, int64_t)>& handler) override;
+};  
+  
+  
+// ─────────────────────────────────────────────────────────────────────────────  
+// DistributedKVStorageBackend — StorageBackendInterface 的分布式 KV 实现  
+// ─────────────────────────────────────────────────────────────────────────────  
+class DistributedKVStorageBackend : public StorageBackendInterface {  
+   public:  
+    DistributedKVStorageBackend(const FileStorageConfig& config);  
+  
+    tl::expected<void, ErrorCode> Init() override;  
+  
+    tl::expected<int64_t, ErrorCode> BatchOffload(  
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,  
+        std::function<ErrorCode(const std::vector<std::string>& keys,  
+                                std::vector<StorageObjectMetadata>& metadatas)>  
+            complete_handler,  
+        std::function<void(const std::vector<std::string>& evicted_keys)>  
+            eviction_handler = nullptr) override;  
+  
+    tl::expected<void, ErrorCode> BatchLoad(  
+        std::unordered_map<std::string, Slice>& batched_slices) override;  
+  
+    tl::expected<bool, ErrorCode> IsExist(const std::string& key) override;  
+  
+    tl::expected<bool, ErrorCode> IsEnableOffloading() override;  
+  
+tl::expected<void, ErrorCode> ScanMeta(
+        const std::function<ErrorCode(
+            const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
+
+    // 测试用 friend 声明
+    friend class StorageBackendTest;
+
+   private:
+    std::shared_ptr<IDistributedKVClient> kv_client_ = nullptr;  
+    std::atomic<bool> initialized_{false};  
+    std::atomic<int64_t> total_keys_{0};  
+    std::atomic<int64_t> total_size_{0};  
 };
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
