@@ -1249,17 +1249,18 @@ class IDistributedKVClient {
                                       int64_t value_size)>& handler) = 0;  
 };
 
-// Step 1: 实现 IDistributedKVClient（封装KVC接口）  
+// 实现 IDistributedKVClient（封装KVC接口）  
 class UbsKVClient : public IDistributedKVClient {  
 public:  
-    ErrorCode Init() override { }  
-    ErrorCode BatchPut(const std::vector<std::string>& keys,  
-                                 const std::vector<std::string>& values) override { ... }  
+    ErrorCode Init() override;
+    tl::expected<std::vector<int>, ErrorCode> BatchPut(const std::vector<std::string>& keys,  
+                                 const std::vector<std::string>& values) override;
     ErrorCode BatchGet(const std::vector<std::string>& keys,  
-                                 std::unordered_map<std::string, Slice>& dest) override { ... }  
-    tl::expected<bool, ErrorCode> Exists(const std::string& key) override { ... }  
+                                 std::unordered_map<std::string, Slice>& dest) override;
+    tl::expected<bool, ErrorCode> Exists(const std::string& key) override;
+    tl::expected<bool, ErrorCode> Exists(const std::string& key) override;
     ErrorCode ScanKeys(  
-        const std::function<ErrorCode(const std::string&, int64_t)>& handler) override { ... }  
+        const std::function<ErrorCode(const std::string&, int64_t)>& handler) override;
 };  
   
   
