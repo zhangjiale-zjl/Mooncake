@@ -3194,13 +3194,93 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ScanMeta(
     return {};
 }
 
-// ─────────────────────────────────────────────────────────────────────────────  
+ErrorCode UbsKVClient::Init()
+{
+    auto ret = DlUbsioApi::LoadLibrary();
+    if (ret != 0) {
+        LOG(ERROR) << "Failed to load ubsio library";
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    ret = DlUbsioApi::UbsioClientInit(-1);
+    if (ret != 0) {
+        LOG(ERROR) << "Failed to init ubsio client";
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
+tl::expected<std::vector<int>, ErrorCode> UbsKVClient::BatchPut(const std::vector<std::string>& keys,  
+                                const std::vector<std::string>& values)
+{
+    if (keys.size() != values.size()) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    std::vector<int32_t> put_results(keys.size(), ErrorCode::INTERNAL_ERROR);
+    std::vector<char *> key_ptrs(keys.size(), nullptr);
+    std::vector<void *> value_ptrs(values.size(), nullptr);
+    std::vector<size_t> value_sizes(values.size(), 0);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        key_ptrs[i] = const_cast<char *>(keys[i].c_str());
+        value_ptrs[i] = const_cast<void *>(values[i].c_str());
+        value_sizes[i] = values[i].size();
+    }
+    auto ret = DlUbsioApi::UbsioBatchPut(key_ptrs.data(), key_ptrs.size(), value_ptrs.data(),
+                                         value_sizes.data(), put_results.data(), 0);
+    if (ret != 0) {
+        LOG(ERROR) << "Failed to batch put, ret: " << ret;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return put_results;
+}
+
+ErrorCode UbsKVClient::BatchGet(std::unordered_map<std::string, Slice>& dest)
+{
+    std::vector<int> get_results(dest.size(), ErrorCode::INTERNAL_ERROR);
+    std::vector<char *> key_ptrs(dest.size(), nullptr);
+    std::vector<void *> value_ptrs(dest.size(), nullptr);
+    std::vector<size_t> value_sizes(dest.size(), 0);
+    uint32_t index = 0;
+    for (auto& [key, slice] : dest) {
+        key_ptrs[index] = key.c_str();
+        value_ptrs[index] = slice.ptr;
+        value_sizes[index] = slice.size;
+        ++index;
+    }
+    auto ret = DlUbsioApi::UbsioBatchGet(key_ptrs.data(), key_ptrs.size(), value_ptrs.data(),
+                                         value_sizes.data(), get_results.data(), 0);
+    if (ret != 0) {
+        LOG(ERROR) << "Failed to batch get, ret: " << ret;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    for (uint32_t i = 0; i < get_results.size(), ++i) {
+        if (get_results[i] != 0) {
+            LOG(ERROR) << "Failed to batch get, index:" << i << ", result: " << get_results[i];
+            return ErrorCode::INTERNAL_ERROR;
+        }
+    }
+    return ErrorCode::OK;
+}
+
+bool UbsKVClient::Exists(const std::string& key)
+{
+    auto ret = DlUbsioApi::UbsioExist(key.c_str(), 0);
+    if (!ret) {
+        LOG(ERROR) << "Not exist key: " << key;
+        return false;
+    }
+    return true;
+}
+
+ErrorCode UbsKVClient::ScanKeys(  
+    const std::function<ErrorCode(const std::string&, int64_t)>& handler)
+{
+    LOG(ERROR) << "Ubsio not support scan meta";
+    return ErrorCode::OK;
+}
   
 DistributedKVStorageBackend::DistributedKVStorageBackend(  
     const FileStorageConfig& config)  
     : StorageBackendInterface(config) {}  
-  
-// ─────────────────────────────────────────────────────────────────────────────  
   
 tl::expected<void, ErrorCode> DistributedKVStorageBackend::Init() {  
     if (initialized_.load(std::memory_order_acquire)) return {};  
@@ -3274,28 +3354,43 @@ tl::expected<int64_t, ErrorCode> DistributedKVStorageBackend::BatchOffload(
     if (put_keys.empty()) return 0;  
   
     auto err = kv_client_->BatchPut(put_keys, put_values);  
-    if (err != ErrorCode::OK) {  
+    if (!err) {  
         LOG(ERROR) << "DistributedKVStorageBackend::BatchOffload: "  
-                      "BatchPut failed: " << err;  
-        return tl::make_unexpected(err);  
-    }  
+                      "BatchPut failed: " << err.error();
+        return tl::make_unexpected(err.error());  
+    }
+    auto& put_results = err.value();
+    std::vector<std::string> success_keys;  
+    std::vector<StorageObjectMetadata> success_metadatas;  
+    success_keys.reserve(put_keys.size());  
+    success_metadatas.reserve(put_keys.size()); 
+    for (size_t i = 0; i < put_results.size(); ++i) {
+        if (put_results[i] != 0) {
+            LOG(ERROR) << "DistributedKVStorageBackend::BatchOffload: "
+                          "BatchPut failed for key "
+                       << put_keys[i] << ", result: " << put_results[i];
+            continue;
+        }
+        total_size_.fetch_add(metadatas[i].data_size, std::memory_order_relaxed);
+        success_keys.emplace_back(std::move(put_keys[i]));
+        success_metadatas.emplace_back(std::move(metadatas[i]));
+    }
+                   
   
     // 更新容量计数器  
-    total_keys_.fetch_add(static_cast<int64_t>(put_keys.size()),  
-                          std::memory_order_relaxed);  
-    for (const auto& m : metadatas)  
-        total_size_.fetch_add(m.data_size, std::memory_order_relaxed);  
+    total_keys_.fetch_add(static_cast<int64_t>(success_keys.size()),  
+                          std::memory_order_relaxed); 
   
     // 通知 master 添加 LOCAL_DISK 副本  
     // FileStorage 的 complete_handler 会将 transport_endpoint 填为 local_rpc_addr_  
-    auto handler_err = complete_handler(put_keys, metadatas);  
+    auto handler_err = complete_handler(success_keys, success_metadatas);  
     if (handler_err != ErrorCode::OK) {  
         LOG(ERROR) << "DistributedKVStorageBackend::BatchOffload: "  
                       "complete_handler failed: " << handler_err;  
         return tl::make_unexpected(handler_err);  
     }  
   
-    return static_cast<int64_t>(put_keys.size());  
+    return static_cast<int64_t>(success_keys.size());  
 }  
   
 // ─────────────────────────────────────────────────────────────────────────────  
@@ -3310,13 +3405,9 @@ tl::expected<void, ErrorCode> DistributedKVStorageBackend::BatchLoad(
         LOG(ERROR) << "DistributedKVStorageBackend not initialized";  
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);  
     }  
-    if (batched_slices.empty()) return {};  
+    if (batched_slices.empty()) return {};
   
-    std::vector<std::string> keys;  
-    keys.reserve(batched_slices.size());  
-    for (const auto& [key, _] : batched_slices) keys.push_back(key);  
-  
-    auto err = kv_client_->BatchGet(keys, batched_slices);  
+    auto err = kv_client_->BatchGet(batched_slices);  
     if (err != ErrorCode::OK) {  
         LOG(ERROR) << "DistributedKVStorageBackend::BatchLoad: "  
                       "BatchGet failed: " << err;  
@@ -3426,11 +3517,13 @@ CreateStorageBackend(const FileStorageConfig& config) {
         }
         case StorageBackendType::kDistributedKV: {  
             return std::make_shared<DistributedKVStorageBackend>(config);
+        }
         default: {
             LOG(FATAL) << "Unsupported backend type";
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
     }
 }
+
 
 }  // namespace mooncake
