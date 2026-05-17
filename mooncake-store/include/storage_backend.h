@@ -1258,7 +1258,6 @@ public:
     ErrorCode BatchGet(const std::vector<std::string>& keys,  
                                  std::unordered_map<std::string, Slice>& dest) override;
     tl::expected<bool, ErrorCode> Exists(const std::string& key) override;
-    tl::expected<bool, ErrorCode> Exists(const std::string& key) override;
     ErrorCode ScanKeys(  
         const std::function<ErrorCode(const std::string&, int64_t)>& handler) override;
 };  

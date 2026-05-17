@@ -3252,7 +3252,7 @@ ErrorCode UbsKVClient::BatchGet(std::unordered_map<std::string, Slice>& dest)
         LOG(ERROR) << "Failed to batch get, ret: " << ret;
         return ErrorCode::INTERNAL_ERROR;
     }
-    for (uint32_t i = 0; i < get_results.size(), ++i) {
+    for (uint32_t i = 0; i < get_results.size(); ++i) {
         if (get_results[i] != 0) {
             LOG(ERROR) << "Failed to batch get, index:" << i << ", result: " << get_results[i];
             return ErrorCode::INTERNAL_ERROR;
@@ -3261,11 +3261,10 @@ ErrorCode UbsKVClient::BatchGet(std::unordered_map<std::string, Slice>& dest)
     return ErrorCode::OK;
 }
 
-bool UbsKVClient::Exists(const std::string& key)
+tl::expected<bool, ErrorCode> UbsKVClient::Exists(const std::string& key)
 {
     auto ret = DlUbsioApi::UbsioExist(key.c_str(), 0);
     if (!ret) {
-        LOG(ERROR) << "Not exist key: " << key;
         return false;
     }
     return true;
@@ -3330,25 +3329,26 @@ tl::expected<int64_t, ErrorCode> DistributedKVStorageBackend::BatchOffload(
     for (const auto& [key, slices] : batch_object) {  
         if (slices.empty()) continue;  
   
-        // 将多个 Slice 拼接为一个连续字节串  
-        int64_t value_size = 0;  
-        for (const auto& s : slices) value_size += static_cast<int64_t>(s.size);  
-  
-        std::string value;  
-        value.reserve(static_cast<size_t>(value_size));  
-        for (const auto& s : slices)  
-            value.append(static_cast<const char*>(s.ptr), s.size);  
-  
-        put_keys.push_back(key);  
-        put_values.push_back(std::move(value));  
-        // transport_endpoint 留空，由 FileStorage::complete_handler 填充  
-        metadatas.push_back(StorageObjectMetadata{  
-            0,                                 // bucket_id: 不使用  
-            0,                                 // offset: 不使用  
-            static_cast<int64_t>(key.size()),  // key_size  
-            value_size,                        // data_size: 必须正确填写  
-            ""                                 // transport_endpoint: 框架填充  
-        });  
+// 将多个 Slice 拼接为一个连续字节串
+        int64_t key_size = static_cast<int64_t>(key.size());
+        int64_t value_size = 0;
+        for (const auto& s : slices) value_size += static_cast<int64_t>(s.size);
+
+        std::string value;
+        value.reserve(static_cast<size_t>(value_size));
+        for (const auto& s : slices)
+            value.append(static_cast<const char*>(s.ptr), s.size);
+
+        put_keys.push_back(std::move(key));
+        put_values.push_back(std::move(value));
+        // transport_endpoint 留空，由 FileStorage::complete_handler 填充
+        metadatas.push_back(StorageObjectMetadata{
+            0,                                 // bucket_id: 不使用
+            0,                                 // offset: 不使用
+            key_size,                          // key_size (保存移动前的size)
+            value_size,                        // data_size: 必须正确填写
+            ""                                 // transport_endpoint: 框架填充
+        });
     }  
   
     if (put_keys.empty()) return 0;  
@@ -3381,8 +3381,12 @@ tl::expected<int64_t, ErrorCode> DistributedKVStorageBackend::BatchOffload(
     total_keys_.fetch_add(static_cast<int64_t>(success_keys.size()),  
                           std::memory_order_relaxed); 
   
-    // 通知 master 添加 LOCAL_DISK 副本  
-    // FileStorage 的 complete_handler 会将 transport_endpoint 填为 local_rpc_addr_  
+    // 通知 master 添加 LOCAL_DISK 副本
+    // FileStorage 的 complete_handler 会将 transport_endpoint 填为 local_rpc_addr_
+    if (!complete_handler) {
+        LOG(ERROR) << "complete_handler is nullptr";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
     auto handler_err = complete_handler(success_keys, success_metadatas);  
     if (handler_err != ErrorCode::OK) {  
         LOG(ERROR) << "DistributedKVStorageBackend::BatchOffload: "  
