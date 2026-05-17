@@ -1287,12 +1287,15 @@ class DistributedKVStorageBackend : public StorageBackendInterface {
   
     tl::expected<bool, ErrorCode> IsEnableOffloading() override;  
   
-    tl::expected<void, ErrorCode> ScanMeta(  
-        const std::function<ErrorCode(  
-            const std::vector<std::string>& keys,  
+tl::expected<void, ErrorCode> ScanMeta(
+        const std::function<ErrorCode(
+            const std::vector<std::string>& keys,
             std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
-  
-   private:  
+
+    // 测试用 friend 声明
+    friend class StorageBackendTest;
+
+   private:
     std::shared_ptr<IDistributedKVClient> kv_client_ = nullptr;  
     std::atomic<bool> initialized_{false};  
     std::atomic<int64_t> total_keys_{0};  

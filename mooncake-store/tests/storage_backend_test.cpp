@@ -20,6 +20,86 @@
 namespace fs = std::filesystem;
 namespace mooncake::test {
 
+// ============================================================================
+// MockDistributedKVClient - 用于测试 DistributedKVStorageBackend
+// ============================================================================
+class MockDistributedKVClient : public IDistributedKVClient {
+   public:
+    MockDistributedKVClient() = default;
+
+    ErrorCode Init() override { return init_result_; }
+
+    ErrorCode BatchPut(const std::vector<std::string>& keys,
+                       const std::vector<std::string>& values) override {
+        if (batch_put_should_fail_) {
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        for (size_t i = 0; i < keys.size(); ++i) {
+            stored_data_[keys[i]] = values[i];
+        }
+        return batch_put_result_;
+    }
+
+    ErrorCode BatchGet(const std::vector<std::string>& keys,
+                       std::unordered_map<std::string, Slice>& dest) override {
+        if (batch_get_should_fail_) {
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        for (const auto& key : keys) {
+            auto it = dest.find(key);
+            if (it == dest.end()) continue;
+            auto data_it = stored_data_.find(key);
+            if (data_it != stored_data_.end()) {
+                auto& slice = it->second;
+                size_t copy_size = std::min(slice.size, data_it->second.size());
+                std::memcpy(slice.ptr, data_it->second.data(), copy_size);
+            }
+        }
+        return batch_get_result_;
+    }
+
+    tl::expected<bool, ErrorCode> Exists(const std::string& key) override {
+        if (exists_should_fail_) {
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        return stored_data_.find(key) != stored_data_.end();
+    }
+
+    ErrorCode ScanKeys(
+        const std::function<ErrorCode(const std::string&, int64_t)>& handler) override {
+        if (scan_should_fail_) {
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        for (const auto& [key, value] : stored_data_) {
+            auto err = handler(key, value.size());
+            if (err != ErrorCode::OK) return err;
+        }
+        return ErrorCode::OK;
+    }
+
+    // 辅助方法
+    void SetInitResult(ErrorCode code) { init_result_ = code; }
+    void SetBatchPutResult(ErrorCode code) { batch_put_result_ = code; }
+    void SetBatchGetResult(ErrorCode code) { batch_get_result_ = code; }
+    void SetExistsShouldFail(bool fail) { exists_should_fail_ = fail; }
+    void SetScanShouldFail(bool fail) { scan_should_fail_ = fail; }
+    void SetBatchPutShouldFail(bool fail) { batch_put_should_fail_ = fail; }
+    void SetBatchGetShouldFail(bool fail) { batch_get_should_fail_ = fail; }
+    void SetStoredData(std::unordered_map<std::string, std::string> data) {
+        stored_data_ = std::move(data);
+    }
+
+   private:
+    ErrorCode init_result_ = ErrorCode::OK;
+    ErrorCode batch_put_result_ = ErrorCode::OK;
+    ErrorCode batch_get_result_ = ErrorCode::OK;
+    bool exists_should_fail_ = false;
+    bool scan_should_fail_ = false;
+    bool batch_put_should_fail_ = false;
+    bool batch_get_should_fail_ = false;
+    std::unordered_map<std::string, std::string> stored_data_;
+};
+
 class StorageBackendTest : public ::testing::Test {
    protected:
     std::string data_path;
@@ -2707,6 +2787,483 @@ TEST_F(StorageBackendTest, AdaptorBatchOffload_EvictionHandlerCalled) {
         << "Should have evicted at least one key";
     EXPECT_EQ(evicted_keys[0], "key_1")
         << "FIFO eviction should evict key_1 first";
+}
+
+// ============================================================================
+// DistributedKVStorageBackend Tests (统一使用 StorageBackendTest)
+// ============================================================================
+
+TEST_F(StorageBackendTest, DistributedKVStorageBackend_Init_Success) {
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributedKV;
+    config.total_size_limit = 100 * 1024 * 1024;
+    config.total_keys_limit = 10000;
+
+    DistributedKVStorageBackend storage_backend(config);
+    auto mock_client = std::make_shared<MockDistributedKVClient>();
+    mock_client->SetInitResult(ErrorCode::OK);
+    storage_backend.kv_client_ = mock_client;
+
+    auto result = storage_backend.Init();
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(storage_backend.initialized_.load(std::memory_order_acquire));
+}
+
+TEST_F(StorageBackendTest, DistributedKVStorageBackend_Init_Failure) {
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributedKV;
+    config.total_size_limit = 100 * 1024 * 1024;
+    config.total_keys_limit = 10000;
+
+    DistributedKVStorageBackend storage_backend(config);
+    auto mock_client = std::make_shared<MockDistributedKVClient>();
+    mock_client->SetInitResult(ErrorCode::INTERNAL_ERROR);
+    storage_backend.kv_client_ = mock_client;
+
+    auto result = storage_backend.Init();
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INTERNAL_ERROR);
+}
+
+TEST_F(StorageBackendTest, DistributedKVStorageBackend_BatchOffload_Basic) {
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributedKV;
+    config.total_size_limit = 100 * 1024 * 1024;
+    config.total_keys_limit = 10000;
+
+    DistributedKVStorageBackend storage_backend(config);
+    auto mock_client = std::make_shared<MockDistributedKVClient>();
+    storage_backend.kv_client_ = mock_client;
+    storage_backend.initialized_.store(true, std::memory_order_release);
+
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    std::vector<std::unique_ptr<char[]>> buffers;
+
+    std::string key = "test_key";
+    std::string value = "test_value";
+    auto buf = std::make_unique<char[]>(value.size());
+    std::memcpy(buf.get(), value.data(), value.size());
+    batch.emplace(key, std::vector<Slice>{Slice{buf.get(), value.size()}});
+    buffers.push_back(std::move(buf));
+
+    bool handler_called = false;
+    auto offload_res = storage_backend.BatchOffload(
+        batch,
+        [&](const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metas) {
+            handler_called = true;
+            EXPECT_EQ(keys.size(), 1);
+            EXPECT_EQ(keys[0], "test_key");
+            EXPECT_EQ(metas[0].key_size, 8);
+            EXPECT_EQ(metas[0].data_size, 10);
+            return ErrorCode::OK;
+        });
+
+    ASSERT_TRUE(offload_res.has_value());
+    EXPECT_EQ(offload_res.value(), 1);
+    EXPECT_TRUE(handler_called);
+    EXPECT_EQ(storage_backend.total_keys_.load(), 1);
+    EXPECT_EQ(storage_backend.total_size_.load(), 10);
+}
+
+TEST_F(StorageBackendTest, DistributedKVStorageBackend_BatchOffload_MultipleKeys) {
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributedKV;
+    config.total_size_limit = 100 * 1024 * 1024;
+    config.total_keys_limit = 10000;
+
+    DistributedKVStorageBackend storage_backend(config);
+    auto mock_client = std::make_shared<MockDistributedKVClient>();
+    storage_backend.kv_client_ = mock_client;
+    storage_backend.initialized_.store(true, std::memory_order_release);
+
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    std::vector<std::unique_ptr<char[]>> buffers;
+
+    std::vector<std::pair<std::string, std::string>> test_data = {
+        {"key1", "value1"}, {"key2", "value2"}, {"key3", "value3"}};
+
+    for (const auto& [key, value] : test_data) {
+        auto buf = std::make_unique<char[]>(value.size());
+        std::memcpy(buf.get(), value.data(), value.size());
+        batch.emplace(key, std::vector<Slice>{Slice{buf.get(), value.size()}});
+        buffers.push_back(std::move(buf));
+    }
+
+    auto offload_res = storage_backend.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+
+    ASSERT_TRUE(offload_res.has_value());
+    EXPECT_EQ(offload_res.value(), 3);
+    EXPECT_EQ(storage_backend.total_keys_.load(), 3);
+    EXPECT_EQ(storage_backend.total_size_.load(), 18);
+}
+
+TEST_F(StorageBackendTest, DistributedKVStorageBackend_BatchOffload_EmptyBatch) {
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributedKV;
+    config.total_size_limit = 100 * 1024 * 1024;
+    config.total_keys_limit = 10000;
+
+    DistributedKVStorageBackend storage_backend(config);
+    auto mock_client = std::make_shared<MockDistributedKVClient>();
+    storage_backend.kv_client_ = mock_client;
+    storage_backend.initialized_.store(true, std::memory_order_release);
+
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+
+    auto offload_res = storage_backend.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+
+    ASSERT_TRUE(offload_res.has_value());
+    EXPECT_EQ(offload_res.value(), 0);
+}
+
+TEST_F(StorageBackendTest, DistributedKVStorageBackend_BatchOffload_NotInitialized) {
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributedKV;
+    config.total_size_limit = 100 * 1024 * 1024;
+    config.total_keys_limit = 10000;
+
+    DistributedKVStorageBackend storage_backend(config);
+    auto mock_client = std::make_shared<MockDistributedKVClient>();
+    storage_backend.kv_client_ = mock_client;
+
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    auto buf = std::make_unique<char[]>(10);
+    batch.emplace("key", std::vector<Slice>{Slice{buf.get(), 10}});
+
+    auto offload_res = storage_backend.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+
+    ASSERT_FALSE(offload_res.has_value());
+    EXPECT_EQ(offload_res.error(), ErrorCode::INTERNAL_ERROR);
+}
+
+TEST_F(StorageBackendTest, DistributedKVStorageBackend_BatchOffload_ExceedSizeLimit) {
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributedKV;
+    config.total_size_limit = 100 * 1024 * 1024;
+    config.total_keys_limit = 10000;
+
+    DistributedKVStorageBackend storage_backend(config);
+    auto mock_client = std::make_shared<MockDistributedKVClient>();
+    storage_backend.kv_client_ = mock_client;
+    storage_backend.initialized_.store(true, std::memory_order_release);
+    storage_backend.total_size_.store(150 * 1024 * 1024, std::memory_order_release);
+
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    auto buf = std::make_unique<char[]>(10);
+    batch.emplace("key", std::vector<Slice>{Slice{buf.get(), 10}});
+
+    auto offload_res = storage_backend.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+
+    ASSERT_FALSE(offload_res.has_value());
+    EXPECT_EQ(offload_res.error(), ErrorCode::KEYS_ULTRA_LIMIT);
+}
+
+TEST_F(StorageBackendTest, DistributedKVStorageBackend_BatchOffload_ExceedKeysLimit) {
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributedKV;
+    config.total_size_limit = 100 * 1024 * 1024;
+    config.total_keys_limit = 10000;
+
+    DistributedKVStorageBackend storage_backend(config);
+    auto mock_client = std::make_shared<MockDistributedKVClient>();
+    storage_backend.kv_client_ = mock_client;
+    storage_backend.initialized_.store(true, std::memory_order_release);
+    storage_backend.total_keys_.store(20000, std::memory_order_release);
+
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    auto buf = std::make_unique<char[]>(10);
+    batch.emplace("key", std::vector<Slice>{Slice{buf.get(), 10}});
+
+    auto offload_res = storage_backend.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+
+    ASSERT_FALSE(offload_res.has_value());
+    EXPECT_EQ(offload_res.error(), ErrorCode::KEYS_ULTRA_LIMIT);
+}
+
+TEST_F(StorageBackendTest, DistributedKVStorageBackend_BatchLoad_Basic) {
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributedKV;
+    config.total_size_limit = 100 * 1024 * 1024;
+    config.total_keys_limit = 10000;
+
+    DistributedKVStorageBackend storage_backend(config);
+    auto mock_client = std::make_shared<MockDistributedKVClient>();
+    mock_client->SetStoredData({{"key1", "value1"}, {"key2", "value2"}});
+    storage_backend.kv_client_ = mock_client;
+    storage_backend.initialized_.store(true, std::memory_order_release);
+
+    std::unordered_map<std::string, Slice> load_slices;
+    std::vector<std::unique_ptr<char[]>> buffers;
+
+    for (const auto& key : {"key1", "key2"}) {
+        auto buf = std::make_unique<char[]>(64);
+        load_slices.emplace(key, Slice{buf.get(), 64});
+        buffers.push_back(std::move(buf));
+    }
+
+    auto load_res = storage_backend.BatchLoad(load_slices);
+    ASSERT_TRUE(load_res.has_value());
+
+    std::string val1(static_cast<char*>(load_slices["key1"].ptr), 6);
+    std::string val2(static_cast<char*>(load_slices["key2"].ptr), 6);
+    EXPECT_EQ(val1, "value1");
+    EXPECT_EQ(val2, "value2");
+}
+
+TEST_F(StorageBackendTest, DistributedKVStorageBackend_BatchLoad_KeyNotFound) {
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributedKV;
+    config.total_size_limit = 100 * 1024 * 1024;
+    config.total_keys_limit = 10000;
+
+    DistributedKVStorageBackend storage_backend(config);
+    auto mock_client = std::make_shared<MockDistributedKVClient>();
+    mock_client->SetStoredData({{"key1", "value1"}});
+    storage_backend.kv_client_ = mock_client;
+    storage_backend.initialized_.store(true, std::memory_order_release);
+
+    std::unordered_map<std::string, Slice> load_slices;
+    auto buf = std::make_unique<char[]>(64);
+    load_slices.emplace("nonexistent_key", Slice{buf.get(), 64});
+
+    auto load_res = storage_backend.BatchLoad(load_slices);
+    ASSERT_TRUE(load_res.has_value());
+}
+
+TEST_F(StorageBackendTest, DistributedKVStorageBackend_BatchLoad_NotInitialized) {
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributedKV;
+    config.total_size_limit = 100 * 1024 * 1024;
+    config.total_keys_limit = 10000;
+
+    DistributedKVStorageBackend storage_backend(config);
+    auto mock_client = std::make_shared<MockDistributedKVClient>();
+    storage_backend.kv_client_ = mock_client;
+
+    std::unordered_map<std::string, Slice> load_slices;
+    auto buf = std::make_unique<char[]>(64);
+    load_slices.emplace("key", Slice{buf.get(), 64});
+
+    auto load_res = storage_backend.BatchLoad(load_slices);
+    ASSERT_FALSE(load_res.has_value());
+    EXPECT_EQ(load_res.error(), ErrorCode::INTERNAL_ERROR);
+}
+
+TEST_F(StorageBackendTest, DistributedKVStorageBackend_IsExist_Found) {
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributedKV;
+    config.total_size_limit = 100 * 1024 * 1024;
+    config.total_keys_limit = 10000;
+
+    DistributedKVStorageBackend storage_backend(config);
+    auto mock_client = std::make_shared<MockDistributedKVClient>();
+    mock_client->SetStoredData({{"existing_key", "value"}});
+    storage_backend.kv_client_ = mock_client;
+    storage_backend.initialized_.store(true, std::memory_order_release);
+
+    auto exist_res = storage_backend.IsExist("existing_key");
+    ASSERT_TRUE(exist_res.has_value());
+    EXPECT_TRUE(exist_res.value());
+}
+
+TEST_F(StorageBackendTest, DistributedKVStorageBackend_IsExist_NotFound) {
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributedKV;
+    config.total_size_limit = 100 * 1024 * 1024;
+    config.total_keys_limit = 10000;
+
+    DistributedKVStorageBackend storage_backend(config);
+    auto mock_client = std::make_shared<MockDistributedKVClient>();
+    mock_client->SetStoredData({{"some_key", "value"}});
+    storage_backend.kv_client_ = mock_client;
+    storage_backend.initialized_.store(true, std::memory_order_release);
+
+    auto exist_res = storage_backend.IsExist("nonexistent_key");
+    ASSERT_TRUE(exist_res.has_value());
+    EXPECT_FALSE(exist_res.value());
+}
+
+TEST_F(StorageBackendTest, DistributedKVStorageBackend_IsExist_NotInitialized) {
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributedKV;
+    config.total_size_limit = 100 * 1024 * 1024;
+    config.total_keys_limit = 10000;
+
+    DistributedKVStorageBackend storage_backend(config);
+    auto mock_client = std::make_shared<MockDistributedKVClient>();
+    storage_backend.kv_client_ = mock_client;
+
+    auto exist_res = storage_backend.IsExist("key");
+    ASSERT_FALSE(exist_res.has_value());
+    EXPECT_EQ(exist_res.error(), ErrorCode::INTERNAL_ERROR);
+}
+
+TEST_F(StorageBackendTest, DistributedKVStorageBackend_IsEnableOffloading_WithinLimits) {
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributedKV;
+    config.total_size_limit = 100 * 1024 * 1024;
+    config.total_keys_limit = 10000;
+
+    DistributedKVStorageBackend storage_backend(config);
+    auto mock_client = std::make_shared<MockDistributedKVClient>();
+    storage_backend.kv_client_ = mock_client;
+    storage_backend.initialized_.store(true, std::memory_order_release);
+    storage_backend.total_size_.store(50 * 1024 * 1024, std::memory_order_release);
+    storage_backend.total_keys_.store(5000, std::memory_order_release);
+
+    auto enable_res = storage_backend.IsEnableOffloading();
+    ASSERT_TRUE(enable_res.has_value());
+    EXPECT_TRUE(enable_res.value());
+}
+
+TEST_F(StorageBackendTest, DistributedKVStorageBackend_IsEnableOffloading_ExceedSizeLimit) {
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributedKV;
+    config.total_size_limit = 100 * 1024 * 1024;
+    config.total_keys_limit = 10000;
+
+    DistributedKVStorageBackend storage_backend(config);
+    auto mock_client = std::make_shared<MockDistributedKVClient>();
+    storage_backend.kv_client_ = mock_client;
+    storage_backend.initialized_.store(true, std::memory_order_release);
+    storage_backend.total_size_.store(150 * 1024 * 1024, std::memory_order_release);
+
+    auto enable_res = storage_backend.IsEnableOffloading();
+    ASSERT_TRUE(enable_res.has_value());
+    EXPECT_FALSE(enable_res.value());
+}
+
+TEST_F(StorageBackendTest, DistributedKVStorageBackend_IsEnableOffloading_ExceedKeysLimit) {
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributedKV;
+    config.total_size_limit = 100 * 1024 * 1024;
+    config.total_keys_limit = 10000;
+
+    DistributedKVStorageBackend storage_backend(config);
+    auto mock_client = std::make_shared<MockDistributedKVClient>();
+    storage_backend.kv_client_ = mock_client;
+    storage_backend.initialized_.store(true, std::memory_order_release);
+    storage_backend.total_keys_.store(15000, std::memory_order_release);
+
+    auto enable_res = storage_backend.IsEnableOffloading();
+    ASSERT_TRUE(enable_res.has_value());
+    EXPECT_FALSE(enable_res.value());
+}
+
+TEST_F(StorageBackendTest, DistributedKVStorageBackend_ScanMeta_Basic) {
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributedKV;
+    config.total_size_limit = 100 * 1024 * 1024;
+    config.total_keys_limit = 10000;
+
+    DistributedKVStorageBackend storage_backend(config);
+    auto mock_client = std::make_shared<MockDistributedKVClient>();
+    mock_client->SetStoredData({
+        {"key1", "value1"},
+        {"key2", "value2"},
+        {"key3", "value3"}
+    });
+    storage_backend.kv_client_ = mock_client;
+    storage_backend.initialized_.store(true, std::memory_order_release);
+
+    std::vector<std::string> scan_keys;
+    std::vector<StorageObjectMetadata> scan_metas;
+
+    auto scan_res = storage_backend.ScanMeta(
+        [&](const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metas) {
+            scan_keys.insert(scan_keys.end(), keys.begin(), keys.end());
+            scan_metas.insert(scan_metas.end(), metas.begin(), metas.end());
+            return ErrorCode::OK;
+        });
+
+    ASSERT_TRUE(scan_res.has_value());
+    EXPECT_EQ(scan_keys.size(), 3);
+    EXPECT_EQ(scan_metas.size(), 3);
+    EXPECT_EQ(storage_backend.total_keys_.load(), 3);
+    EXPECT_EQ(scan_metas[0].data_size, 6);
+}
+
+TEST_F(StorageBackendTest, DistributedKVStorageBackend_ScanMeta_Empty) {
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributedKV;
+    config.total_size_limit = 100 * 1024 * 1024;
+    config.total_keys_limit = 10000;
+
+    DistributedKVStorageBackend storage_backend(config);
+    auto mock_client = std::make_shared<MockDistributedKVClient>();
+    mock_client->SetStoredData({});
+    storage_backend.kv_client_ = mock_client;
+    storage_backend.initialized_.store(true, std::memory_order_release);
+
+    std::vector<std::string> scan_keys;
+    std::vector<StorageObjectMetadata> scan_metas;
+
+    auto scan_res = storage_backend.ScanMeta(
+        [&](const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metas) {
+            scan_keys.insert(scan_keys.end(), keys.begin(), keys.end());
+            scan_metas.insert(scan_metas.end(), metas.begin(), metas.end());
+            return ErrorCode::OK;
+        });
+
+    ASSERT_TRUE(scan_res.has_value());
+    EXPECT_EQ(scan_keys.size(), 0);
+}
+
+TEST_F(StorageBackendTest, DistributedKVStorageBackend_ScanMeta_NotInitialized) {
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributedKV;
+    config.total_size_limit = 100 * 1024 * 1024;
+    config.total_keys_limit = 10000;
+
+    DistributedKVStorageBackend storage_backend(config);
+    auto mock_client = std::make_shared<MockDistributedKVClient>();
+    storage_backend.kv_client_ = mock_client;
+
+    auto scan_res = storage_backend.ScanMeta(
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+
+    ASSERT_FALSE(scan_res.has_value());
+    EXPECT_EQ(scan_res.error(), ErrorCode::INTERNAL_ERROR);
+}
+
+TEST_F(StorageBackendTest, DistributedKVStorageBackend_ScanMeta_Failure) {
+    FileStorageConfig config;
+    config.storage_backend_type = StorageBackendType::kDistributedKV;
+    config.total_size_limit = 100 * 1024 * 1024;
+    config.total_keys_limit = 10000;
+
+    DistributedKVStorageBackend storage_backend(config);
+    auto mock_client = std::make_shared<MockDistributedKVClient>();
+    mock_client->SetStoredData({{"key1", "value1"}});
+    mock_client->SetScanShouldFail(true);
+    storage_backend.kv_client_ = mock_client;
+    storage_backend.initialized_.store(true, std::memory_order_release);
+
+    auto scan_res = storage_backend.ScanMeta(
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+
+    ASSERT_FALSE(scan_res.has_value());
+    EXPECT_EQ(scan_res.error(), ErrorCode::INTERNAL_ERROR);
 }
 
 //-----------------------------------------------------------------------------
