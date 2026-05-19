@@ -136,8 +136,10 @@ bool FileStorageConfig::ValidatePath(std::string path) const {
 }
 
 bool FileStorageConfig::Validate() const {
-    if (!ValidatePath(storage_filepath)) {
-        return false;
+    if (storage_backend_type != StorageBackendType::kDistributedKV) {
+        if (!ValidatePath(storage_filepath)) {
+            return false;
+        }
     }
     if (total_keys_limit <= 0) {
         LOG(ERROR) << "FileStorageConfig: total_keys_limit must > 0";
@@ -516,6 +518,9 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     }
 
     // === STEP 2: Persist offloaded objects (trigger actual data migration) ===
+    if (offloading_objects.empty()) {
+        return {};
+    }
     auto offload_result = OffloadObjects(offloading_objects);
     if (!offload_result) {
         LOG(ERROR) << "Failed to persist objects with error: "

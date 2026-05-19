@@ -4,11 +4,13 @@
 
 #include <atomic>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "file_interface.h"
@@ -1231,7 +1233,7 @@ class IDistributedKVClient {
     virtual ErrorCode Init() = 0;  
   
     // 批量写入：keys[i] 对应 values[i]（已拼接好的字节串）  
-    virtual ErrorCode BatchPut(const std::vector<std::string>& keys,  
+    virtual tl::expected<std::vector<int>, ErrorCode> BatchPut(const std::vector<std::string>& keys,
                                const std::vector<std::string>& values) = 0;  
   
     // 批量读取：将 key 对应的数据读入 dest_slices[key].ptr  
