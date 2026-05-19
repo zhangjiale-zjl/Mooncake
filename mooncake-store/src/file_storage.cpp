@@ -516,6 +516,9 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     }
 
     // === STEP 2: Persist offloaded objects (trigger actual data migration) ===
+    if (offloading_objects.empty()) {
+        return {};
+    }
     auto offload_result = OffloadObjects(offloading_objects);
     if (!offload_result) {
         LOG(ERROR) << "Failed to persist objects with error: "
