@@ -29,15 +29,18 @@ class MockDistributedKVClient : public IDistributedKVClient {
 
     ErrorCode Init() override { return init_result_; }
 
-    ErrorCode BatchPut(const std::vector<std::string>& keys,
+    tl::expected<std::vector<int>, ErrorCode> BatchPut(const std::vector<std::string>& keys,
                        const std::vector<std::string>& values) override {
         if (batch_put_should_fail_) {
-            return ErrorCode::INTERNAL_ERROR;
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
         for (size_t i = 0; i < keys.size(); ++i) {
             stored_data_[keys[i]] = values[i];
         }
-        return batch_put_result_;
+        if (batch_put_result_ != ErrorCode::OK) {
+            return tl::make_unexpected(batch_put_result_);
+        }
+        return std::vector<int>(keys.size(), 0);
     }
 
     ErrorCode BatchGet(const std::vector<std::string>& keys,

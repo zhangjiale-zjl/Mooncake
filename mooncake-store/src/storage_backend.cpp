@@ -1,4 +1,5 @@
 #include "storage_backend.h"
+#include "dl_ubsio_api.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -3215,13 +3216,13 @@ tl::expected<std::vector<int>, ErrorCode> UbsKVClient::BatchPut(const std::vecto
     if (keys.size() != values.size()) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    std::vector<int32_t> put_results(keys.size(), ErrorCode::INTERNAL_ERROR);
+    std::vector<int32_t> put_results(keys.size(), -1);
     std::vector<char *> key_ptrs(keys.size(), nullptr);
     std::vector<void *> value_ptrs(values.size(), nullptr);
     std::vector<size_t> value_sizes(values.size(), 0);
     for (size_t i = 0; i < keys.size(); ++i) {
         key_ptrs[i] = const_cast<char *>(keys[i].c_str());
-        value_ptrs[i] = const_cast<void *>(values[i].c_str());
+        value_ptrs[i] = const_cast<char *>(values[i].data());
         value_sizes[i] = values[i].size();
     }
     auto ret = DlUbsioApi::UbsioBatchPut(key_ptrs.data(), key_ptrs.size(), value_ptrs.data(),
@@ -3233,28 +3234,33 @@ tl::expected<std::vector<int>, ErrorCode> UbsKVClient::BatchPut(const std::vecto
     return put_results;
 }
 
-ErrorCode UbsKVClient::BatchGet(std::unordered_map<std::string, Slice>& dest)
+ErrorCode UbsKVClient::BatchGet(const std::vector<std::string>& keys,
+                                 std::unordered_map<std::string, Slice>& dest)
 {
-    std::vector<int> get_results(dest.size(), ErrorCode::INTERNAL_ERROR);
-    std::vector<char *> key_ptrs(dest.size(), nullptr);
-    std::vector<void *> value_ptrs(dest.size(), nullptr);
-    std::vector<size_t> value_sizes(dest.size(), 0);
-    uint32_t index = 0;
-    for (auto& [key, slice] : dest) {
-        key_ptrs[index] = key.c_str();
-        value_ptrs[index] = slice.ptr;
-        value_sizes[index] = slice.size;
-        ++index;
+    std::vector<int> get_results(keys.size(), -1);
+    std::vector<char *> key_ptrs(keys.size(), nullptr);
+    std::vector<void *> value_ptrs(keys.size(), nullptr);
+    std::vector<size_t> value_sizes(keys.size(), 0);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        key_ptrs[i] = const_cast<char *>(keys[i].c_str());
+        auto it = dest.find(keys[i]);
+        if (it == dest.end()) {
+            LOG(ERROR) << "Key not found in dest: " << keys[i];
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        value_ptrs[i] = it->second.ptr;
+        value_sizes[i] = it->second.size;
     }
-    auto ret = DlUbsioApi::UbsioBatchGet(key_ptrs.data(), key_ptrs.size(), value_ptrs.data(),
-                                         value_sizes.data(), get_results.data(), 0);
+    auto ret = DlUbsioApi::UbsioBatchGet(key_ptrs.data(), static_cast<uint32_t>(key_ptrs.size()),
+                                         value_ptrs.data(), value_sizes.data(),
+                                         get_results.data(), 0);
     if (ret != 0) {
         LOG(ERROR) << "Failed to batch get, ret: " << ret;
         return ErrorCode::INTERNAL_ERROR;
     }
-    for (uint32_t i = 0; i < get_results.size(); ++i) {
+    for (size_t i = 0; i < get_results.size(); ++i) {
         if (get_results[i] != 0) {
-            LOG(ERROR) << "Failed to batch get, index:" << i << ", result: " << get_results[i];
+            LOG(ERROR) << "Failed to batch get, key:" << keys[i] << ", result: " << get_results[i];
             return ErrorCode::INTERNAL_ERROR;
         }
     }
@@ -3410,8 +3416,13 @@ tl::expected<void, ErrorCode> DistributedKVStorageBackend::BatchLoad(
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);  
     }  
     if (batched_slices.empty()) return {};
-  
-    auto err = kv_client_->BatchGet(batched_slices);  
+
+    std::vector<std::string> keys;
+    keys.reserve(batched_slices.size());
+    for (const auto& [key, _] : batched_slices) {
+        keys.push_back(key);
+    }
+    auto err = kv_client_->BatchGet(keys, batched_slices);
     if (err != ErrorCode::OK) {  
         LOG(ERROR) << "DistributedKVStorageBackend::BatchLoad: "  
                       "BatchGet failed: " << err;  
