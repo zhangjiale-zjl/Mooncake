@@ -3217,11 +3217,11 @@ tl::expected<std::vector<int>, ErrorCode> UbsKVClient::BatchPut(const std::vecto
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     std::vector<int32_t> put_results(keys.size(), -1);
-    std::vector<char *> key_ptrs(keys.size(), nullptr);
+    std::vector<const char *> key_ptrs(keys.size(), nullptr);
     std::vector<void *> value_ptrs(values.size(), nullptr);
     std::vector<size_t> value_sizes(values.size(), 0);
     for (size_t i = 0; i < keys.size(); ++i) {
-        key_ptrs[i] = const_cast<char *>(keys[i].c_str());
+        key_ptrs[i] = keys[i].c_str();
         value_ptrs[i] = const_cast<char *>(values[i].data());
         value_sizes[i] = values[i].size();
     }
@@ -3238,11 +3238,11 @@ ErrorCode UbsKVClient::BatchGet(const std::vector<std::string>& keys,
                                  std::unordered_map<std::string, Slice>& dest)
 {
     std::vector<int> get_results(keys.size(), -1);
-    std::vector<char *> key_ptrs(keys.size(), nullptr);
+    std::vector<const char *> key_ptrs(keys.size(), nullptr);
     std::vector<void *> value_ptrs(keys.size(), nullptr);
     std::vector<size_t> value_sizes(keys.size(), 0);
     for (size_t i = 0; i < keys.size(); ++i) {
-        key_ptrs[i] = const_cast<char *>(keys[i].c_str());
+        key_ptrs[i] = keys[i].c_str();
         auto it = dest.find(keys[i]);
         if (it == dest.end()) {
             LOG(ERROR) << "Key not found in dest: " << keys[i];
