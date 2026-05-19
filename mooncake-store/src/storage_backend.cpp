@@ -3269,7 +3269,7 @@ ErrorCode UbsKVClient::BatchGet(const std::vector<std::string>& keys,
     for (size_t i = 0; i < get_results.size(); ++i) {
         if (get_results[i] != 0) {
             LOG(ERROR) << "Failed to batch get, key:" << keys[i] << ", result: " << get_results[i];
-            GetFreeThreadPool().enqueue([value_ptrs = std::move(value_ptrs)]() {
+            GetFreeThreadPool().enqueue([value_ptrs = std::move(value_ptrs)]() mutable {
                 DlUbsioApi::UbsioBatchFreeAddress(value_ptrs.data(),
                                                   static_cast<uint32_t>(value_ptrs.size()));
             });
@@ -3281,10 +3281,11 @@ ErrorCode UbsKVClient::BatchGet(const std::vector<std::string>& keys,
         size_t copy_size = std::min(it->second.size, value_sizes[i]);
         std::memcpy(it->second.ptr, value_ptrs[i], copy_size);
     }
-    GetFreeThreadPool().enqueue([value_ptrs = std::move(value_ptrs)]() {
+    GetFreeThreadPool().enqueue([value_ptrs = std::move(value_ptrs)]() mutable {
         DlUbsioApi::UbsioBatchFreeAddress(value_ptrs.data(),
                                           static_cast<uint32_t>(value_ptrs.size()));
     });
+    return ErrorCode::OK;
 }
 
 tl::expected<bool, ErrorCode> UbsKVClient::Exists(const std::string& key)
