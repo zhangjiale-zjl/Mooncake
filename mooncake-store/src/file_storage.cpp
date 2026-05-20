@@ -136,8 +136,10 @@ bool FileStorageConfig::ValidatePath(std::string path) const {
 }
 
 bool FileStorageConfig::Validate() const {
-    if (!ValidatePath(storage_filepath)) {
-        return false;
+    if (storage_backend_type != StorageBackendType::kDistributedKV) {
+        if (!ValidatePath(storage_filepath)) {
+            return false;
+        }
     }
     if (total_keys_limit <= 0) {
         LOG(ERROR) << "FileStorageConfig: total_keys_limit must > 0";
