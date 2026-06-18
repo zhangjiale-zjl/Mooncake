@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <cstdint>
 #include <cstddef>
@@ -7,7 +7,7 @@
 
 namespace mooncake {
 
-using ubsio_client_initFunc = int32_t (*)(int32_t);
+using ubsio_client_initFunc = int32_t (*)(int32_t, uint64_t);
 using ubsio_putFunc = int32_t (*)(const char *, void *, size_t, uint32_t);
 using ubsio_getFunc = int32_t (*)(const char *, void *, size_t, uint32_t);
 using ubsio_existFunc = bool (*)(const char *, uint32_t);
@@ -27,12 +27,12 @@ public:
     static int32_t LoadLibrary();
     static void CleanupLibrary();
 
-    static inline int32_t UbsioClientInit(int32_t deviceId)
+    static inline int32_t UbsioClientInit(int32_t deviceId, uint64_t ssdSize)
     {
         if (pUbsioClientInit == nullptr) {
             return -1;
         }
-        return pUbsioClientInit(deviceId);
+        return pUbsioClientInit(deviceId, ssdSize);
     }
 
     static inline int32_t UbsioPut(const char *key, void *buf, size_t length, uint32_t flags)

@@ -1,4 +1,4 @@
-#include "storage_backend.h"
+﻿#include "storage_backend.h"
 #include "dl_ubsio_api.h"
 #include "thread_pool.h"
 
@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <errno.h>
+#include <cstdlib>
 #include <cstring>
 
 #include <regex>
@@ -3211,9 +3212,17 @@ ErrorCode UbsKVClient::Init()
         LOG(ERROR) << "Failed to load ubsio library";
         return ErrorCode::INTERNAL_ERROR;
     }
-    ret = DlUbsioApi::UbsioClientInit(-1);
+    int32_t deviceId = 0;
+    const char* envDeviceId = std::getenv("LOCAL_RANK");
+    if (envDeviceId != nullptr) {
+        deviceId = std::atoi(envDeviceId);
+    } else {
+        LOG(WARNING) << "LOCAL_RANK not set, defaulting to device ID 0";
+    }
+    LOG(INFO) << "Using device ID: " << deviceId;
+    ret = DlUbsioApi::UbsioClientInit(deviceId, 0);
     if (ret != 0) {
-        LOG(ERROR) << "Failed to init ubsio client";
+        LOG(ERROR) << "Failed to init ubsio client, deviceId=" << deviceId;
         return ErrorCode::INTERNAL_ERROR;
     }
     return ErrorCode::OK;
