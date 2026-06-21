@@ -1,4 +1,4 @@
-﻿#include "storage_backend.h"
+#include "storage_backend.h"
 #include "dl_ubsio_api.h"
 #include "thread_pool.h"
 
@@ -8,6 +8,9 @@
 #include <sys/uio.h>
 #include <errno.h>
 #include <cstdlib>
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
+#include <acl/acl_rt.h>
+#endif
 #include <cstring>
 
 #include <regex>
@@ -3213,11 +3216,11 @@ ErrorCode UbsKVClient::Init()
         return ErrorCode::INTERNAL_ERROR;
     }
     int32_t deviceId = 0;
-    const char* envDeviceId = std::getenv("LOCAL_RANK");
-    if (envDeviceId != nullptr) {
-        deviceId = std::atoi(envDeviceId);
-    } else {
-        LOG(WARNING) << "LOCAL_RANK not set, defaulting to device ID 0";
+    aclError aclRet = aclrtGetDevice(&deviceId);
+    LOG(INFO) << "aclrtGetDevice returned deviceId=" << deviceId << ", ret=" << aclRet;
+    if (aclRet != ACL_SUCCESS) {
+        LOG(WARNING) << "aclrtGetDevice failed, ret=" << aclRet << ", defaulting to device ID 0";
+        deviceId = 0;
     }
     LOG(INFO) << "Using device ID: " << deviceId;
     ret = DlUbsioApi::UbsioClientInit(deviceId, 0);
