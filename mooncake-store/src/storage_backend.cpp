@@ -3200,14 +3200,6 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ScanMeta(
     return {};
 }
 
-namespace {
-// 单线程池，专门用于 UbsioBatchFreeAddress 异步释放，避免频繁创建/销毁临时线程
-mooncake::ThreadPool& GetFreeThreadPool() {
-    static mooncake::ThreadPool pool(1);
-    return pool;
-}
-}  // namespace
-
 ErrorCode UbsKVClient::Init()
 {
     auto ret = DlUbsioApi::LoadLibrary();
@@ -3269,6 +3261,7 @@ ErrorCode UbsKVClient::BatchGet(const std::vector<std::string>& keys,
             LOG(ERROR) << "Key not found in dest: " << keys[i];
             return ErrorCode::INTERNAL_ERROR;
         }
+        value_ptrs[i] = it->second.ptr;
         value_sizes[i] = it->second.size;
     }
     auto ret = DlUbsioApi::UbsioBatchGet(key_ptrs.data(), static_cast<uint32_t>(key_ptrs.size()),
@@ -3281,22 +3274,9 @@ ErrorCode UbsKVClient::BatchGet(const std::vector<std::string>& keys,
     for (size_t i = 0; i < get_results.size(); ++i) {
         if (get_results[i] != 0) {
             LOG(ERROR) << "Failed to batch get, key:" << keys[i] << ", result: " << get_results[i];
-            GetFreeThreadPool().enqueue([value_ptrs = std::move(value_ptrs)]() mutable {
-                DlUbsioApi::UbsioBatchFreeAddress(value_ptrs.data(),
-                                                  static_cast<uint32_t>(value_ptrs.size()));
-            });
             return ErrorCode::INTERNAL_ERROR;
         }
     }
-    for (size_t i = 0; i < keys.size(); ++i) {
-        auto it = dest.find(keys[i]);
-        size_t copy_size = std::min(it->second.size, value_sizes[i]);
-        std::memcpy(it->second.ptr, value_ptrs[i], copy_size);
-    }
-    GetFreeThreadPool().enqueue([value_ptrs = std::move(value_ptrs)]() mutable {
-        DlUbsioApi::UbsioBatchFreeAddress(value_ptrs.data(),
-                                          static_cast<uint32_t>(value_ptrs.size()));
-    });
     return ErrorCode::OK;
 }
 
