@@ -107,6 +107,22 @@ inline void SetDevice(int device_id) {
 #endif
 }
 
+// Get the device currently bound to the calling thread.
+inline bool GetDevice(int* out_device_id) {
+    if (!out_device_id) return false;
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+    defined(USE_HYGON) || defined(USE_COREX)
+    return cudaGetDevice(out_device_id) == cudaSuccess;
+#elif defined(USE_HIP)
+    return hipGetDevice(out_device_id) == hipSuccess;
+#elif defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
+    return aclrtGetDevice(out_device_id) == ACL_SUCCESS;
+#else
+    *out_device_id = 0;
+    return false;
+#endif
+}
+
 // Copy host memory to device. Caller must have called SetDevice first.
 inline bool CopyHostToDevice(void* dst, const void* src, size_t size) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \

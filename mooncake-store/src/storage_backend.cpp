@@ -1,5 +1,6 @@
 #include "storage_backend.h"
 #include "dl_ubsio_api.h"
+#include "gpu_staging_utils.h"
 #include "thread_pool.h"
 
 #include <fcntl.h>
@@ -8,9 +9,6 @@
 #include <sys/uio.h>
 #include <errno.h>
 #include <cstdlib>
-#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
-#include <acl/acl_rt.h>
-#endif
 #include <cstring>
 
 #include <regex>
@@ -3207,12 +3205,10 @@ ErrorCode UbsKVClient::Init()
         LOG(ERROR) << "Failed to load ubsio library";
         return ErrorCode::INTERNAL_ERROR;
     }
-    int32_t deviceId = 0;
-    aclError aclRet = aclrtGetDevice(&deviceId);
-    LOG(INFO) << "aclrtGetDevice returned deviceId=" << deviceId << ", ret=" << aclRet;
-    if (aclRet != ACL_SUCCESS) {
-        LOG(WARNING) << "aclrtGetDevice failed, ret=" << aclRet << ", defaulting to device ID 0";
-        deviceId = 0;
+    int deviceId = 0;
+    if (!gpu_staging::GetDevice(&deviceId)) {
+        LOG(WARNING) << "Failed to get current accelerator device, "
+                     << "defaulting to device ID 0";
     }
     LOG(INFO) << "Using device ID: " << deviceId;
     ret = DlUbsioApi::UbsioClientInit(deviceId, 0);
@@ -3301,7 +3297,7 @@ DistributedKVStorageBackend::DistributedKVStorageBackend(
     : StorageBackendInterface(config) {}  
   
 tl::expected<void, ErrorCode> DistributedKVStorageBackend::Init() {  
-    if (initialized_.load(std::memory_order_acquire)) return {};  
+    if (initialized_.load(std::memory_order_acquire)) return {};
     kv_client_ = std::make_unique<UbsKVClient>();
     auto err = kv_client_->Init();  
     if (err != ErrorCode::OK) {  
@@ -3309,7 +3305,6 @@ tl::expected<void, ErrorCode> DistributedKVStorageBackend::Init() {
         return tl::make_unexpected(err);  
     }  
     initialized_.store(true, std::memory_order_release);  
-    LOG(INFO) << "DistributedKVStorageBackend initialized.";  
     return {};  
 }  
   
@@ -3331,10 +3326,16 @@ tl::expected<int64_t, ErrorCode> DistributedKVStorageBackend::BatchOffload(
         LOG(ERROR) << "DistributedKVStorageBackend not initialized";  
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);  
     }  
-    if (batch_object.empty()) return 0;  
+    if (batch_object.empty()) {
+        LOG(ERROR) << "batch object is empty";
+        return 0;
+    }
   
     auto enable_res = IsEnableOffloading();  
-    if (!enable_res || !enable_res.value()) {  
+    if (!enable_res) {
+        return tl::make_unexpected(enable_res.error());
+    }
+    if (!enable_res.value()) {
         return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);  
     }  
   
@@ -3408,8 +3409,12 @@ tl::expected<int64_t, ErrorCode> DistributedKVStorageBackend::BatchOffload(
     }
     auto handler_err = complete_handler(success_keys, success_metadatas);  
     if (handler_err != ErrorCode::OK) {  
-        LOG(ERROR) << "DistributedKVStorageBackend::BatchOffload: "  
-                      "complete_handler failed: " << handler_err;  
+        LOG(ERROR)
+            << "Complete handler failed: " << handler_err << " - "
+            << success_keys.size()
+            << " keys were successfully written to distributed KV but master "
+               "was not notified. "
+            << "Master will learn about them via ScanMeta on next restart.";
         return tl::make_unexpected(handler_err);  
     }  
   
@@ -3450,7 +3455,7 @@ tl::expected<bool, ErrorCode> DistributedKVStorageBackend::IsExist(
     const std::string& key) {  
     if (!initialized_.load(std::memory_order_acquire))  
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);  
-    return kv_client_->Exists(key);  
+    return kv_client_->Exists(key);
 }  
   
 tl::expected<bool, ErrorCode> DistributedKVStorageBackend::IsEnableOffloading() {  
@@ -3482,7 +3487,10 @@ tl::expected<void, ErrorCode> DistributedKVStorageBackend::ScanMeta(
     auto flush = [&]() -> bool {  
         if (keys.empty()) return true;  
         auto err = handler(keys, metadatas);  
-        if (err != ErrorCode::OK) { flush_error = err; return false; }  
+        if (err != ErrorCode::OK) {
+            flush_error = err;
+            return false;
+        }
         keys.clear();  
         metadatas.clear();  
         return true;  
@@ -3507,12 +3515,9 @@ tl::expected<void, ErrorCode> DistributedKVStorageBackend::ScanMeta(
             return ErrorCode::OK;  
         });  
   
-    if (err != ErrorCode::OK) return tl::make_unexpected(err);  
+    if (err != ErrorCode::OK) return tl::make_unexpected(err);
     if (!flush()) return tl::make_unexpected(flush_error);  
   
-    LOG(INFO) << "DistributedKVStorageBackend::ScanMeta: recovered "  
-              << total_keys_.load() << " keys, "  
-              << total_size_.load() << " bytes";  
     return {};  
 }
 
