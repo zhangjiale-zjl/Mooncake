@@ -1,0 +1,2 @@
+# Preserve the canonical third-party public header line endings.
+mooncake-transfer-engine/tent/tests/thirdparty/nds/ascend_nds.h text eol=lf

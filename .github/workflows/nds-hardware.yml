@@ -1,0 +1,71 @@
+name: NDS hardware validation (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_file_write:
+        description: 'Create and write a test file in the reserved directory'
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nds-hardware
+  cancel-in-progress: false
+
+jobs:
+  file:
+    if: >-
+      github.repository == 'zhangjiale-zjl/Mooncake' &&
+      vars.NDS_HARDWARE_ENABLED == 'true' && inputs.confirm_file_write
+    runs-on: [self-hosted, linux, ARM64, nds-file]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate the reserved runner contract
+        env:
+          NDS_TEST_DIRECTORY: ${{ vars.NDS_TEST_DIRECTORY }}
+          NDS_DEVICE: ${{ vars.NDS_DEVICE }}
+          NDS_PYTHON: ${{ vars.NDS_PYTHON }}
+        run: |
+          test -n "$NDS_PYTHON" && test -x "$NDS_PYTHON"
+          test -d "$NDS_TEST_DIRECTORY" && test -w "$NDS_TEST_DIRECTORY"
+          [[ "$NDS_DEVICE" =~ ^[0-9]+$ ]]
+          test -e "/dev/davinci$NDS_DEVICE"
+          test -e /dev/p2p_device
+      - name: Build the checked-out revision against the real NDS SDK
+        env:
+          NDS_ROOT: ${{ vars.NDS_ROOT }}
+          NDS_PYTHON: ${{ vars.NDS_PYTHON }}
+        run: |
+          test -f "$NDS_ROOT/include/ascend_nds.h"
+          cmake -S . -B build-nds -DUSE_TENT=ON -DUSE_NDS=ON \
+            -DNDS_ROOT="$NDS_ROOT" -DUSE_ASCEND_DIRECT=ON -DUSE_CUDA=OFF \
+            -DPYTHON_EXECUTABLE="$NDS_PYTHON" -DPython3_EXECUTABLE="$NDS_PYTHON" \
+            -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF \
+            -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF
+          cmake --build build-nds --target tentpy -j2
+      - name: Validate MiniMax-shaped single-card I/O
+        env:
+          NDS_TEST_DIRECTORY: ${{ vars.NDS_TEST_DIRECTORY }}
+          NDS_DEVICE: ${{ vars.NDS_DEVICE }}
+          NDS_PYTHON: ${{ vars.NDS_PYTHON }}
+          NDS_ROOT: ${{ vars.NDS_ROOT }}
+        run: |
+          export PYTHONPATH="$PWD/build-nds/mooncake-transfer-engine/tent/src/python:$PYTHONPATH"
+          export LD_LIBRARY_PATH="$PWD/build-nds/mooncake-common/src:$PWD/build-nds/mooncake-common:$PWD/build-nds/mooncake-transfer-engine/tent/src/metrics:$NDS_ROOT/lib:$LD_LIBRARY_PATH"
+          umask 077
+          test_dir=$(mktemp -d "$NDS_TEST_DIRECTORY/nds-XXXXXX")
+          trap 'rm -f -- "$test_dir/payload.bin"; rmdir -- "$test_dir"' EXIT
+          "$NDS_PYTHON" mooncake-transfer-engine/benchmark/nds/benchmark_nds.py \
+            --file "$test_dir/payload.bin" --device "$NDS_DEVICE" \
+            --bytes 32768 --fragments 124 --batch 950 --key-stride 4194304 \
+            --io-depth 512 --warmup 2 --iterations 30 --json nds-hardware.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nds-file-benchmark
+          path: nds-hardware.json

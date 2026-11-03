@@ -1,0 +1,163 @@
+name: NDS CPU validation
+
+on:
+  push:
+    branches: [chore/tent-nds-validation]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nds-cpu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source:
+    if: >-
+      github.repository == 'zhangjiale-zjl/Mooncake' &&
+      github.ref == 'refs/heads/chore/tent-nds-validation'
+    runs-on: ubuntu-24.04
+    outputs:
+      feature_sha: ${{ steps.source.outputs.feature_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify the tested feature revision
+        id: source
+        run: |
+          feature_sha=$(git rev-parse origin/feat/tent-nds)
+          git merge-base --is-ancestor "$feature_sha" HEAD
+          python3 - "$feature_sha" <<'PY'
+          import subprocess
+          import sys
+          allowed = (
+              'docs/', 'mooncake-transfer-engine/tent/tests/',
+              'mooncake-transfer-engine/benchmark/nds/',
+          )
+          exact = {
+              '.gitattributes', '.github/workflows/nds-ci.yml',
+              '.github/workflows/nds-hardware.yml', '.github/workflows/deploy.yml',
+              'scripts/ci/run_tent_nds_cpu.py',
+              'mooncake-integration/vllm/smoke_tent_nds.py',
+              'mooncake-integration/vllm/smoke_metadata_concurrency.py',
+              'mooncake-integration/vllm/tent_nds_connector.py',
+          }
+          changed = subprocess.check_output(
+              ['git', 'diff', '--name-only', sys.argv[1], 'HEAD'], text=True
+          ).splitlines()
+          unexpected = [p for p in changed if p not in exact and not p.startswith(allowed)]
+          if unexpected:
+              raise SystemExit('Production code differs from feature branch: ' + ', '.join(unexpected))
+          PY
+          echo "feature_sha=$feature_sha" >> "$GITHUB_OUTPUT"
+  cpu:
+    needs: source
+    if: github.repository == 'zhangjiale-zjl/Mooncake'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: ["on", "off"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install CPU build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build pkg-config \
+            python3-dev libgoogle-glog-dev libgflags-dev libnuma-dev \
+            libibverbs-dev libjsoncpp-dev libyaml-cpp-dev libssl-dev \
+            libcurl4-openssl-dev liburing-dev libhiredis-dev libcli11-dev
+      - name: Build, test and consume the installed SDK
+        run: >-
+          python3 scripts/ci/run_tent_nds_cpu.py
+          --mode ${{ matrix.mode }}
+          --build-root ${{ runner.temp }}/nds-${{ matrix.mode }} --jobs 2
+      - name: Upload CPU test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nds-cpu-${{ matrix.mode }}
+          path: |
+            ${{ runner.temp }}/nds-${{ matrix.mode }}/ctest.xml
+            ${{ runner.temp }}/nds-${{ matrix.mode }}/result.json
+            ${{ runner.temp }}/nds-${{ matrix.mode }}/missing-sdk.log
+            ${{ runner.temp }}/nds-${{ matrix.mode }}/build/Testing/Temporary/LastTest.log
+  docs:
+    needs: source
+    if: github.repository == 'zhangjiale-zjl/Mooncake'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r docs/requirements-docs.txt
+      - run: make -C docs html
+  style:
+    needs: source
+    if: github.repository == 'zhangjiale-zjl/Mooncake'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pre-commit clang-format==20.1.8
+      - name: Check only files changed by this branch
+        env:
+          BASE_REF: origin/main
+        run: |
+          git diff --name-only --diff-filter=ACMR -z "$BASE_REF...HEAD" > /tmp/nds-changed-files
+          xargs -0 -r pre-commit run --files < /tmp/nds-changed-files
+          ./scripts/code_format.sh --check --changed-lines --base "$BASE_REF"
+  gate:
+    name: NDS required checks
+    if: always() && github.repository == 'zhangjiale-zjl/Mooncake'
+    needs: [source, cpu, docs, style]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - name: Report verified results to the feature commit
+        uses: actions/github-script@v7
+        env:
+          FEATURE_SHA: ${{ needs.source.outputs.feature_sha }}
+          SOURCE_RESULT: ${{ needs.source.result }}
+          CPU_RESULT: ${{ needs.cpu.result }}
+          DOCS_RESULT: ${{ needs.docs.result }}
+          STYLE_RESULT: ${{ needs.style.result }}
+        with:
+          script: |
+            const sha = process.env.FEATURE_SHA;
+            if (!sha || process.env.SOURCE_RESULT !== 'success') {
+              core.setFailed('The validation branch must contain the current feature revision unchanged.');
+              return;
+            }
+            const results = ['CPU_RESULT', 'DOCS_RESULT', 'STYLE_RESULT'];
+            const passed = results.every(name => process.env[name] === 'success');
+            const details = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.checks.create({
+              ...context.repo,
+              name: 'NDS required checks',
+              head_sha: sha,
+              status: 'completed',
+              conclusion: passed ? 'success' : 'failure',
+              details_url: details,
+              output: {
+                title: passed ? 'NDS validation passed' : 'NDS validation failed',
+                summary: `Feature revision: ${sha}\nValidation revision: ${context.sha}\n` +
+                  results.map(name => `${name}: ${process.env[name]}`).join('\n'),
+              },
+            });
+            if (!passed) core.setFailed('CPU, documentation and style checks must all pass.');

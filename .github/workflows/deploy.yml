@@ -1,9 +1,9 @@
 name: Deploy documentation to GitHub Pages
 
 on:
-  # Runs on pushes targeting the default branch
+  # Publish the configured documentation branch.
   push:
-    branches: ["main"]
+    branches: ["main", "chore/tent-nds-validation"]
     paths:
       - 'docs/**'
       - 'docs/requirements-docs.txt'
@@ -28,12 +28,15 @@ concurrency:
 jobs:
   # Build and deploy job
   build-and-deploy:
-    # Avoid running this workflow on forked repositories
-    if: github.repository == 'kvcache-ai/Mooncake'
+    if: >-
+      (github.repository == 'kvcache-ai/Mooncake' && github.ref_name == 'main') ||
+      (github.repository == 'zhangjiale-zjl/Mooncake' &&
+       github.ref_name == (vars.DOCS_PUBLISH_BRANCH || 'main'))
     environment:
       name: github-pages
-      url: https://kvcache-ai.github.io/Mooncake/
+      url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,9 +44,15 @@ jobs:
           persist-credentials: false
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.x'  # Choose the specific version as needed
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: docs/requirements-docs.txt
+
+      - name: Setup Pages
+        id: pages
+        uses: actions/configure-pages@v5
 
       - name: Install dependencies
         run: |
@@ -60,13 +69,14 @@ jobs:
         run: python docs/scripts/update_pypi_downloads.py
 
       - name: Build documentation
+        env:
+          MOONCAKE_DOCS_REPOSITORY: ${{ github.repository }}
+          MOONCAKE_DOCS_BRANCH: ${{ github.ref_name }}
+          MOONCAKE_DOCS_BASE_URL: ${{ steps.pages.outputs.base_url }}/
         run: |
           cd docs
           make clean
           make html
-
-      - name: Setup Pages
-        uses: actions/configure-pages@v5
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
