@@ -135,6 +135,7 @@ option(USE_FABRIC
 option(USE_SHCA "option for using ScaleFabric SHCA InfiniBand" OFF)
 option(USE_HYLINK "option for enabling hylink transport for Hygon DCU/DTK" OFF)
 option(USE_MEMFABRIC "option for using memfabric transport" OFF)
+option(USE_NDS "Build the TENT NPU Direct Storage transport" OFF)
 
 if(USE_UB)
   add_compile_definitions(USE_UB)
@@ -222,6 +223,9 @@ option(USE_EVENT_DRIVEN_COMPLETION
        "option for using event-driven completion (store & transfer engine)" OFF)
 
 option(USE_TENT "option for building Mooncake TENT" OFF)
+if(USE_NDS AND NOT USE_TENT)
+  message(FATAL_ERROR "USE_NDS requires USE_TENT=ON")
+endif()
 option(ENABLE_MULTI_PROTOCOL
        "option for enabling multi-protocol support in transfer engine" OFF)
 if(ENABLE_MULTI_PROTOCOL)
