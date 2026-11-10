@@ -115,6 +115,7 @@ struct NdsBatch : Transport::SubBatch {
         size_t count = std::min(depth - inflight, ios.size() - submitted);
         if (!count) return;
         submission.clear();
+        submission.reserve(count);
         for (size_t i = submitted; i < submitted + count; ++i) {
             auto& io = *ios[i];
             io.params.cookie = reinterpret_cast<void*>(i + 1);
@@ -181,7 +182,12 @@ struct NdsTransport::Impl {
     std::map<std::pair<std::string, int>, std::shared_ptr<File>> files;
     std::vector<NDSfileBatchHandle_t> idle_contexts;
 
-    Status validate(const Request& request, uint64_t& base, std::string& path) {
+    struct ValidatedSegment {
+        std::string path;
+        uint64_t length;
+    };
+    Status validate(const Request& request, uint64_t& base, std::string& path,
+                    std::map<SegmentID, ValidatedSegment>& validated) {
         auto addr = reinterpret_cast<uint64_t>(request.source);
         if (!installed || !request.length || addr % kAlignment ||
             request.length % kAlignment || request.target_offset % kAlignment ||
@@ -206,6 +212,14 @@ struct NdsTransport::Impl {
             return Status::AddressNotRegistered(
                 "NDS source exceeds registration");
         }
+        auto cached = validated.find(request.target_id);
+        if (cached != validated.end()) {
+            if (!contains(0, cached->second.length, request.target_offset, request.length)) {
+                return Status::InvalidArgument("NDS request exceeds File Segment");
+            }
+            path = cached->second.path;
+            return Status::OK();
+        }
         return metadata->segmentManager().withCachedSegment(
             request.target_id, [&](SegmentDesc* segment) {
                 auto local = metadata->segmentManager().getLocal();
@@ -223,6 +237,7 @@ struct NdsTransport::Impl {
                     return Status::InvalidArgument(
                         "NDS request exceeds File Segment");
                 path = entries[0].path;
+                validated.emplace(request.target_id, ValidatedSegment{path, entries[0].length});
                 return Status::OK();
             });
     }
@@ -446,11 +461,13 @@ Status NdsTransport::submitTransferTasks(SubBatchRef batch,
         opened;
     size_t first_io = entry->ios.size();
     entry->tasks.reserve(entry->tasks.size() + requests.size());
+    entry->ios.reserve(entry->ios.size() + requests.size());
+    std::map<SegmentID, Impl::ValidatedSegment> validated;
     for (const auto& request : requests) {
         Task task;
         task.request = request;
         std::string path;
-        auto status = impl_->validate(request, task.buffer_base, path);
+        auto status = impl_->validate(request, task.buffer_base, path, validated);
         std::shared_ptr<File> file;
         if (status.ok()) {
             int access = request.opcode == Request::READ ? O_RDONLY : O_RDWR;
@@ -476,7 +493,7 @@ Status NdsTransport::submitTransferTasks(SubBatchRef batch,
             LOG(ERROR) << status.ToString();
             task.status.s = FAILED;
         }
-        entry->tasks.push_back(task);
+        entry->tasks.push_back(std::move(task));
         if (status.ok())
             impl_->append(*entry, entry->tasks.size() - 1, file, first_io);
     }
