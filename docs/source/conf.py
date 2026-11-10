@@ -62,12 +62,7 @@ templates_path = ["_templates"]
 exclude_patterns: list[str] = [
     "**/*.template.md",
     "**/*.inc.md",
-    # NDS has an actively maintained Chinese guide linked from its English page.
-    *[
-        f"zh_archive/{entry.name}"
-        for entry in (Path(__file__).parent / "zh_archive").iterdir()
-        if entry.name != "nds_transport.md"
-    ],
+    "zh_archive/**",
 ]
 
 # Exclude the prompt "$" when copying code
@@ -80,19 +75,12 @@ copybutton_prompt_is_regexp = True
 # a list of builtin themes.
 #
 html_title = project
-docs_repository = os.environ.get("MOONCAKE_DOCS_REPOSITORY", "kvcache-ai/Mooncake")
-docs_branch = os.environ.get("MOONCAKE_DOCS_BRANCH", "main")
-docs_repository_url = f"https://github.com/{docs_repository}"
-html_baseurl = os.environ.get(
-    "MOONCAKE_DOCS_BASE_URL", "https://kvcache-ai.github.io/Mooncake/"
-)
 html_theme = "sphinx_book_theme"
 html_logo = "image/mooncake-icon.png"
 html_favicon = "image/moonshot.ico"
 html_theme_options = {
     "path_to_docs": "docs/source",
-    "repository_url": docs_repository_url,
-    "repository_branch": docs_branch,
+    "repository_url": "https://github.com/kvcache-ai/Mooncake",
     "use_repository_button": True,
     "use_edit_page_button": True,
     # Prevents the full API being added to the left sidebar of every page.
@@ -131,12 +119,12 @@ myst_url_schemes = {
         "classes": ["github"],
     },
     "gh-dir": {
-        "url": f"{docs_repository_url}/tree/{docs_branch}/{{{{path}}}}",
+        "url": "https://github.com/kvcache-ai/Mooncake/tree/main/{{path}}",
         "title": "{{path}}",
         "classes": ["github"],
     },
     "gh-file": {
-        "url": f"{docs_repository_url}/blob/{docs_branch}/{{{{path}}}}",
+        "url": "https://github.com/kvcache-ai/Mooncake/blob/main/{{path}}",
         "title": "{{path}}",
         "classes": ["github"],
     },
@@ -212,8 +200,8 @@ def linkcode_resolve(domain, info):
         base, branch = get_repo_base_and_branch(pr_number)
         if base and branch:
             return f"https://github.com/{base}/blob/{branch}/{filename}#L{lineno}"
-    # Link to the repository and branch used for this documentation build.
-    return f"{docs_repository_url}/blob/{docs_branch}/{filename.as_posix()}#L{lineno}"
+    # Otherwise, link to the source file on the main branch
+    return f"https://github.com/kvcache-ai/Mooncake/blob/main/{filename}#L{lineno}"
 
 
 # Mock out external dependencies here, otherwise sphinx-argparse won't work.
