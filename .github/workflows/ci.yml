@@ -609,6 +609,7 @@ jobs:
               - 'CMakeLists.txt'
               - 'dependencies.sh'
               - 'scripts/ci/run_transfer_engine_rust_smoke.sh'
+              - 'scripts/ci/run_tent_nds_cpu.py'
               - '.github/actions/**'
               - '.github/workflows/ci.yml'
             store_rs:
@@ -719,6 +720,17 @@ jobs:
             need_cuda: false
             metrics_flags: ''
             build_targets: tent_memfabric_transport_test transfer_engine
+          # Build the real NDS transport against its CPU mock SDK. The NDS
+          # script exercises both ON/OFF modes, including installed consumers.
+          - name: nds-mock
+            cmake_flags: >-
+              -DUSE_CUDA=OFF -DUSE_NDS=ON
+              -DNDS_ROOT=$RUNNER_TEMP/nds-on/mock-sdk
+              -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF
+              -DCMAKE_BUILD_TYPE=Debug
+            need_cuda: false
+            metrics_flags: ''
+            build_targets: transfer_engine
     name: tent-ci (${{ matrix.name }})
     env:
       CI: "true"
@@ -756,6 +768,13 @@ jobs:
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
 
+    - name: Test NDS transport and installed consumers (ON/OFF)
+      if: matrix.name == 'nds-mock'
+      run: |
+        python3 scripts/ci/run_tent_nds_cpu.py --mode on --build-root "$RUNNER_TEMP/nds-on" --jobs 2
+        python3 scripts/ci/run_tent_nds_cpu.py --mode off --build-root "$RUNNER_TEMP/nds-off" --jobs 2
+      shell: bash
+
     - name: Configure project with TENT
       run: |
         mkdir build-tent
@@ -790,6 +809,10 @@ jobs:
         fi
         if [ "${{ matrix.need_cuda }}" = "true" ]; then
           export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+        fi
+        if [ "${{ matrix.name }}" = "nds-mock" ]; then
+          export LD_LIBRARY_PATH="$RUNNER_TEMP/nds-on/mock-sdk/lib:${LD_LIBRARY_PATH:-}"
+          export RUSTFLAGS="${RUSTFLAGS:-} -L native=$RUNNER_TEMP/nds-on/mock-sdk/lib -l dylib=ascend_nds"
         fi
         cd mooncake-transfer-engine/rust
         export MOONCAKE_BUILD_DIR=$GITHUB_WORKSPACE/build-tent
@@ -828,7 +851,7 @@ jobs:
     # that every #ifdef USE_CUDA branch compiles.
     - name: Test (TENT)
       id: ctest
-      if: '!matrix.need_cuda'
+      if: "!matrix.need_cuda && matrix.name != 'nds-mock'"
       run: |
         ctest_args=()
         if [ "${{ matrix.name }}" = "memfabric-mock" ]; then
@@ -867,7 +890,12 @@ jobs:
       env:
         MOONCAKE_BUILD_DIR: ${{ github.workspace }}/build-tent
         MOONCAKE_TE_RUST_LINK_ASAN: "0"
-      run: ./scripts/ci/run_transfer_engine_rust_smoke.sh
+      run: |
+        if [ "${{ matrix.name }}" = "nds-mock" ]; then
+          export LD_LIBRARY_PATH="$RUNNER_TEMP/nds-on/mock-sdk/lib:${LD_LIBRARY_PATH:-}"
+          export RUSTFLAGS="${RUSTFLAGS:-} -L native=$RUNNER_TEMP/nds-on/mock-sdk/lib -l dylib=ascend_nds"
+        fi
+        ./scripts/ci/run_transfer_engine_rust_smoke.sh
       shell: bash
 
     - name: Run sccache stat for check

@@ -217,6 +217,7 @@ foreach(
   platform_xpu
   platform_mlu
   tent_xport_gds
+  tent_xport_nds
   tent_xport_uring
   tent_xport_bufio
   tent_xport_mnnvl

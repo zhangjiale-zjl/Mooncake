@@ -749,4 +749,5 @@ If a protocol fails to initialize:
 ../design/transfer-engine/transport/flagcx_transport
 ../design/transfer-engine/transport/mpcomm_transport
 ../design/transfer-engine/transport/memfabric_transport
+../design/transfer-engine/transport/nds_transport
 :::
