@@ -34,7 +34,7 @@ Status storageSize(int fd, uint64_t& length) {
 struct Registration {
     size_t length;
     size_t users;
-    size_t pinned_users;
+    bool pinned;
 };
 // Native initialization is process-wide and not reentrant. Serialize lifecycle,
 // registrations and queue access; polling is always nonblocking under this
@@ -214,8 +214,10 @@ struct NdsTransport::Impl {
         }
         auto cached = validated.find(request.target_id);
         if (cached != validated.end()) {
-            if (!contains(0, cached->second.length, request.target_offset, request.length)) {
-                return Status::InvalidArgument("NDS request exceeds File Segment");
+            if (!contains(0, cached->second.length, request.target_offset,
+                          request.length)) {
+                return Status::InvalidArgument(
+                    "NDS request exceeds File Segment");
             }
             path = cached->second.path;
             return Status::OK();
@@ -237,7 +239,8 @@ struct NdsTransport::Impl {
                     return Status::InvalidArgument(
                         "NDS request exceeds File Segment");
                 path = entries[0].path;
-                validated.emplace(request.target_id, ValidatedSegment{path, entries[0].length});
+                validated.emplace(request.target_id,
+                                  ValidatedSegment{path, entries[0].length});
                 return Status::OK();
             });
     }
@@ -337,12 +340,11 @@ struct NdsTransport::Impl {
         if (it == buffers.end()) return Status::OK();
         drain(addr, false);
         auto shared = driver().buffers.find(addr);
-        if (register_memory) {
-            if (shared->second.pinned_users == 1) {
-                int rc = ndsFileBufDeregister(reinterpret_cast<void*>(addr));
-                if (rc) return ndsError("ndsFileBufDeregister", rc);
-            }
-            --shared->second.pinned_users;
+        // The SDK automatically uses a shared pin even for instances configured
+        // for one-shot mappings. Keep it until every user has drained its I/O.
+        if (shared->second.users == 1 && shared->second.pinned) {
+            int rc = ndsFileBufDeregister(reinterpret_cast<void*>(addr));
+            if (rc) return ndsError("ndsFileBufDeregister", rc);
         }
         if (--shared->second.users == 0) driver().buffers.erase(shared);
         buffers.erase(it);
@@ -467,7 +469,8 @@ Status NdsTransport::submitTransferTasks(SubBatchRef batch,
         Task task;
         task.request = request;
         std::string path;
-        auto status = impl_->validate(request, task.buffer_base, path, validated);
+        auto status =
+            impl_->validate(request, task.buffer_base, path, validated);
         std::shared_ptr<File> file;
         if (status.ok()) {
             int access = request.opcode == Request::READ ? O_RDONLY : O_RDWR;
@@ -538,16 +541,16 @@ Status NdsTransport::addMemoryBuffer(BufferDesc& desc, const MemoryOptions&) {
          (next != buffers.begin() &&
           std::prev(next)->first + std::prev(next)->second.length > desc.addr)))
         return Status::InvalidArgument("Overlapping NDS registrations");
-    if (impl_->register_memory && (!shared || !next->second.pinned_users)) {
+    if (impl_->register_memory && (!shared || !next->second.pinned)) {
         int rc = ndsFileBufRegister(reinterpret_cast<void*>(desc.addr),
                                     desc.length, 0);
         if (rc) return ndsError("ndsFileBufRegister", rc);
     }
     if (!shared)
-        next =
-            buffers.emplace(desc.addr, Registration{desc.length, 0, 0}).first;
+        next = buffers.emplace(desc.addr, Registration{desc.length, 0, false})
+                   .first;
     ++next->second.users;
-    if (impl_->register_memory) ++next->second.pinned_users;
+    if (impl_->register_memory) next->second.pinned = true;
     impl_->buffers.emplace(desc.addr, desc.length);
     desc.transports.push_back(NDS);
     return Status::OK();
