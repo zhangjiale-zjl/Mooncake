@@ -821,6 +821,16 @@ int TransferMetadata::publishSegmentDesc(const std::string &segment_name,
     return 0;
 }
 
+int TransferMetadata::invalidateRemoteSegmentCache(const std::string &name) {
+    RWSpinlock::WriteGuard guard(segment_lock_);
+    auto it = segment_name_to_id_map_.find(name);
+    if (it == segment_name_to_id_map_.end()) return 0;
+    if (it->second == LOCAL_SEGMENT_ID) return -1;
+    segment_id_to_desc_map_.erase(it->second);
+    segment_name_to_id_map_.erase(it);
+    return 0;
+}
+
 int TransferMetadata::removeSegmentDesc(const std::string &segment_name) {
     if (p2p_handshake_mode_) {
         RWSpinlock::WriteGuard guard(segment_lock_);
@@ -1486,6 +1496,16 @@ bool TransferMetadata::SegmentDesc::operator==(const SegmentDesc &other) const {
 }
 
 int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
+    return syncSegmentCacheImpl(segment_name, false);
+}
+
+int TransferMetadata::refreshCachedSegment(const std::string &segment_name) {
+    if (segment_name.empty()) return ERR_INVALID_ARGUMENT;
+    return syncSegmentCacheImpl(segment_name, true);
+}
+
+int TransferMetadata::syncSegmentCacheImpl(const std::string &segment_name,
+                                           bool strict) {
     const auto sync_start = std::chrono::steady_clock::now();
 
     // Collect segment names to sync first, then release lock before network I/O
@@ -1670,6 +1690,10 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
               << ", skipped=" << skipped_count
               << ", invalidated=" << invalidated_count
               << ", sync_duration_ms=" << sync_duration_ms;
+    if (strict && (updated_count + unchanged_count == 0 || failed_count != 0 ||
+                   unavailable_count != 0 || skipped_count != 0)) {
+        return ERR_METADATA;
+    }
     return 0;
 }
 
@@ -1739,9 +1763,8 @@ TransferMetadata::getSegmentDescByID(SegmentID segment_id, bool force_update) {
         // Update cache with write lock
         RWSpinlock::WriteGuard guard(segment_lock_);
         auto old_iter = segment_id_to_desc_map_.find(segment_id);
-        auto old_desc = old_iter == segment_id_to_desc_map_.end()
-                            ? nullptr
-                            : old_iter->second;
+        if (old_iter == segment_id_to_desc_map_.end()) return nullptr;
+        auto old_desc = old_iter->second;
         if (!shouldInstallFetchedSegmentDesc(segment_name, segment_id, old_desc,
                                              segment_desc)) {
             return old_desc;
@@ -1853,6 +1876,13 @@ int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
 
 int TransferMetadata::removeLocalMemoryBuffer(void *addr,
                                               bool update_metadata) {
+    return removeLocalMemoryBuffer(
+        addr, [](const BufferDesc &) { return true; }, update_metadata);
+}
+
+int TransferMetadata::removeLocalMemoryBuffer(
+    void *addr, const std::function<bool(const BufferDesc &)> &pred,
+    bool update_metadata) {
     bool addr_exist = false;
     {
         RWSpinlock::WriteGuard guard(segment_lock_);
@@ -1860,12 +1890,13 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
         auto new_segment_desc = std::make_shared<SegmentDesc>(*segment_desc);
         for (auto iter = new_segment_desc->buffers.begin();
              iter != new_segment_desc->buffers.end(); ++iter) {
-            if (iter->addr == (uint64_t)addr
+            if ((iter->addr == (uint64_t)addr
 #ifdef USE_CXL
-                || (iter->offset + new_segment_desc->cxl_base_addr) ==
-                       (uint64_t)addr
+                 || (iter->offset + new_segment_desc->cxl_base_addr) ==
+                        (uint64_t)addr
 #endif
-            ) {
+                 ) &&
+                pred(*iter)) {
                 new_segment_desc->buffers.erase(iter);
                 addr_exist = true;
                 new_segment_desc->rebuildBufferRangeIndex();

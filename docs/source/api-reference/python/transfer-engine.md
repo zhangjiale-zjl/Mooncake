@@ -591,6 +591,13 @@ Reads bytes from a buffer at the specified address and returns them as a Python 
 
 ### Memory Registration
 
+#### enable_memory_registration_reuse()
+
+Enables {ref}`registration reuse <memory-registration-reuse>` on a classic
+engine. Call before sharing the engine with Store, not concurrently with
+memory registration.
+Returns `0` on success, a negative error code otherwise.
+
 #### register_memory()
 
 ```python
@@ -649,6 +656,33 @@ Unregisters multiple previously registered memory regions in a single batch oper
 **Returns:**
 - `int`: 0 on success, negative value on failure
 
+### Ascend Direct Peers
+
+#### disconnect_all_peers()
+
+```python
+disconnect_all_peers()
+```
+
+Disconnects every peer recorded by the Ascend Direct transport. The call
+waits until transfers that have already started finish, including
+synchronous transfers, asynchronous transfers that are still being
+polled, and same-host device copies that have already been submitted.
+A transfer submitted while the disconnect is in progress fails
+instead of starting, and the process keeps running. After the call
+returns, new transfers can connect to peers again.
+
+This method is available only when Mooncake is built with Ascend Direct
+transport. It returns -1 when the engine is not initialized, the Ascend
+transport is not installed, or the build does not include that transport.
+
+A peer that is already disconnected is removed and counts as success. If
+disconnecting any other peer fails, that peer stays recorded and the call
+returns -1. An empty peer table returns 0.
+
+**Returns:**
+- `int`: 0 when every recorded peer is removed, -1 on failure.
+
 ### Topology and Notification
 
 #### get_local_topology()
@@ -675,6 +709,24 @@ Gets the list of pending transfer notifications received from other nodes.
 
 **Returns:**
 - `List[TransferNotify]`: List of notification objects containing name and message
+
+#### refresh_session()
+
+```python
+refresh_session(peer_server_name)
+```
+
+Refreshes one already-cached remote segment on the classic Transfer Engine.
+Returns 0 when fetched metadata is accepted, including an unchanged descriptor.
+Returns non-zero for an empty or uncached peer, unavailable metadata, rejected
+metadata versions, or an unsupported backend (TENT/TEV1).
+
+This call does not unregister local memory or rebuild RDMA queue pairs. Existing
+transfers retain their shared descriptor references. RPC locations are
+invalidated by the existing refresh path when an accepted descriptor changes
+or advances its version. Success does not prove data-plane health; verify a
+real transfer before restoring traffic. Existing metadata timeouts apply.
+The C++ `syncSegmentCache` and C `openSegmentNoCache` contracts are unchanged.
 
 #### send_probe()
 

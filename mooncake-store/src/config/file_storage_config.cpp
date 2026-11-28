@@ -6,9 +6,11 @@
 #include <locale>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "ascii_string.h"
 #include "bool_parser.h"
 #include "config.h"
 #include "config/distributed_storage_config.h"
@@ -86,6 +88,8 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     config.storage_filepath = Environ::ReadOr(
         Variables::MOONCAKE_OFFLOAD_FILE_STORAGE_PATH, config.storage_filepath);
 
+    config.storage_paths = ResolveOffloadDiskPaths(config.storage_filepath);
+
     config.local_buffer_size =
         Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES,
                         config.local_buffer_size);
@@ -116,6 +120,12 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     config.heartbeat_interval_seconds =
         Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS,
                         config.heartbeat_interval_seconds);
+    config.reclaim_interval_seconds =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_RECLAIM_INTERVAL_SECONDS,
+                        config.reclaim_interval_seconds);
+    config.reclaim_cycle_seconds =
+        Environ::ReadOr(Variables::MOONCAKE_OFFLOAD_RECLAIM_CYCLE_SECONDS,
+                        config.reclaim_cycle_seconds);
     config.client_buffer_gc_interval_seconds = Environ::ReadOr(
         Variables::MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS,
         config.client_buffer_gc_interval_seconds);
@@ -226,11 +236,35 @@ bool FileStorageConfig::ValidatePath(std::string path) const {
 }
 
 bool FileStorageConfig::Validate() const {
+    // storage_filepath may be a comma-separated multi-disk list. ValidatePath
+    // stats a single path and would reject the raw list string (stat of
+    // "/d0,/d1" is ENOENT), so validate each root on its own. Distributed
+    // storage on kvcs resolves its paths through the distributed backend, so
+    // keep skipping the local-directory checks there.
     const bool uses_kvcs =
         storage_backend_type == StorageBackendType::kDistributed &&
         DistributedStorageConfig::FromEnvironment().UsesKvcs();
-    if (!uses_kvcs && !ValidatePath(storage_filepath)) {
-        return false;
+    if (!uses_kvcs) {
+        if (TrimAsciiWhitespace(storage_filepath).empty()) {
+            LOG(ERROR) << "FileStorageConfig: storage_filepath must not be "
+                          "empty";
+            return false;
+        }
+        // Every entry names one disk, so dropping an empty one would silently
+        // run on fewer disks than the list has entries.
+        const auto paths =
+            SplitAsciiList(storage_filepath, ',', /*keep_empty=*/true);
+        for (size_t i = 0; i < paths.size(); ++i) {
+            if (paths[i].empty()) {
+                LOG(ERROR) << "FileStorageConfig: storage_filepath='"
+                           << storage_filepath << "' has an empty entry at "
+                           << "position " << i;
+                return false;
+            }
+            if (!ValidatePath(std::string(paths[i]))) {
+                return false;
+            }
+        }
     }
     if (total_keys_limit <= 0) {
         LOG(ERROR) << "FileStorageConfig: total_keys_limit must > 0";

@@ -42,6 +42,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -109,8 +110,9 @@ var (
 	globalMutex    sync.Mutex
 	globalRefCount int
 	// etcd client for store
-	storeClient *clientv3.Client
-	storeMutex  sync.Mutex
+	storeClient              *clientv3.Client
+	storeMutex               sync.Mutex
+	storeMaxSendMessageBytes int64 = 2 * 1024 * 1024
 	// keep alive contexts for store
 	storeKeepAliveCtx   = make(map[int64]context.CancelFunc)
 	storeKeepAliveMutex sync.Mutex
@@ -282,6 +284,7 @@ func newStoreClientConfig(validEndpoints []string) (clientv3.Config, error) {
 	}
 	return clientv3.Config{
 		Endpoints:            validEndpoints,
+		MaxCallSendMsgSize:   int(atomic.LoadInt64(&storeMaxSendMessageBytes)),
 		DialTimeout:          5 * time.Second,
 		DialKeepAliveTime:    storeDialKeepAliveTime,
 		DialKeepAliveTimeout: storeDialKeepAliveTimeout,
@@ -435,6 +438,29 @@ func getStoreClient() *clientv3.Client {
 	storeMutex.Lock()
 	defer storeMutex.Unlock()
 	return storeClient
+}
+
+// Configure before connecting: live clients retain their original gRPC options.
+func configureStoreMaxSendMessageBytes(maxBytes int32) error {
+	if maxBytes <= 0 {
+		return errors.New("etcd store max send message bytes must be positive")
+	}
+	storeMutex.Lock()
+	defer storeMutex.Unlock()
+	if storeClient != nil && int64(maxBytes) != atomic.LoadInt64(&storeMaxSendMessageBytes) {
+		return errors.New("cannot change etcd store send limit after initialization")
+	}
+	atomic.StoreInt64(&storeMaxSendMessageBytes, int64(maxBytes))
+	return nil
+}
+
+//export SetStoreEtcdMaxSendMessageBytes
+func SetStoreEtcdMaxSendMessageBytes(maxBytes C.int32_t, errMsg **C.char) int {
+	if err := configureStoreMaxSendMessageBytes(int32(maxBytes)); err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	return 0
 }
 
 //export NewStoreEtcdClient
@@ -1223,7 +1249,7 @@ func EtcdStoreGetWithPrefixWrapper(prefix *C.char, prefixSize C.int, keys **C.ch
 }
 
 //export EtcdStoreGetRangeAsJsonWrapper
-func EtcdStoreGetRangeAsJsonWrapper(startKey *C.char, startKeySize C.int, endKey *C.char, endKeySize C.int, limit C.int, outJson **C.char, outJsonSize *C.int, revisionId *C.longlong, errMsg **C.char) int {
+func EtcdStoreGetRangeAsJsonWrapper(startKey *C.char, startKeySize C.int, endKey *C.char, endKeySize C.int, limit C.int, serializable C.int, outJson **C.char, outJsonSize *C.int, revisionId *C.longlong, errMsg **C.char) int {
 	cli := getStoreClient()
 	if cli == nil {
 		*errMsg = C.CString("etcd client not initialized")
@@ -1241,6 +1267,9 @@ func EtcdStoreGetRangeAsJsonWrapper(startKey *C.char, startKeySize C.int, endKey
 	}
 	if limit > 0 {
 		opts = append(opts, clientv3.WithLimit(int64(limit)))
+	}
+	if serializable != 0 {
+		opts = append(opts, clientv3.WithSerializable())
 	}
 	resp, err := cli.Get(ctx, start, opts...)
 	if err != nil {

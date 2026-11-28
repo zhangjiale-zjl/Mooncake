@@ -254,6 +254,15 @@ class TransferMetadata {
     std::shared_ptr<SegmentDesc> getSegmentDescByID(SegmentID segment_id,
                                                     bool force_update = false);
 
+    // Transfer workers must never perform metadata RPCs, even with metacache
+    // off.
+    std::shared_ptr<SegmentDesc> getCachedSegmentDescByID(
+        SegmentID segment_id) {
+        RWSpinlock::ReadGuard guard(segment_lock_);
+        auto it = segment_id_to_desc_map_.find(segment_id);
+        return it == segment_id_to_desc_map_.end() ? nullptr : it->second;
+    }
+
     int updateLocalSegmentDesc(SegmentID segment_id = LOCAL_SEGMENT_ID);
 
     int updateSegmentDesc(const std::string &segment_name,
@@ -267,9 +276,23 @@ class TransferMetadata {
 
     SegmentID getSegmentID(const std::string &segment_name);
 
+    // Unlike getSegmentID, a cache miss must not fetch remote metadata.
+    SegmentID getCachedSegmentID(const std::string &segment_name) {
+        RWSpinlock::ReadGuard guard(segment_lock_);
+        auto it = segment_name_to_id_map_.find(segment_name);
+        return it == segment_name_to_id_map_.end() ? static_cast<SegmentID>(-1)
+                                                   : it->second;
+    }
+
     int syncSegmentCache(const std::string &segment_name);
 
+    // Strict refresh of one cached remote segment; unchanged metadata succeeds.
+    int refreshCachedSegment(const std::string &segment_name);
+
     int removeSegmentDesc(const std::string &segment_name);
+    // Drop only the local remote-descriptor cache; preserve authoritative data
+    // and reject LOCAL_SEGMENT_ID. Caller must quiesce users of cached handles.
+    int invalidateRemoteSegmentCache(const std::string &segment_name);
 
     int addLocalMemoryBuffer(const BufferDesc &buffer_desc,
                              bool update_metadata);
@@ -279,6 +302,13 @@ class TransferMetadata {
     // publish the updated descriptor rather than remove the entry again.
     // ERR_ADDRESS_NOT_REGISTERED means no matching local entry was present.
     int removeLocalMemoryBuffer(void *addr, bool update_metadata);
+
+    // Removes the buffer at addr only when pred accepts the entry, so
+    // transports sharing an address in the local buffer list remove only
+    // their own entries.
+    int removeLocalMemoryBuffer(
+        void *addr, const std::function<bool(const BufferDesc &)> &pred,
+        bool update_metadata);
 
     // Rebuilds interned NIC paths on `desc` before insert. The caller must
     // exclusively own `desc`; do not pass a live descriptor from the metadata
@@ -327,6 +357,8 @@ class TransferMetadata {
     void dumpMetadataContentUnlocked();
 
    private:
+    int syncSegmentCacheImpl(const std::string &segment_name, bool strict);
+
     std::shared_ptr<SegmentDesc> getSegmentDescInternal(
         const std::string &segment_name, bool force_rpc_update,
         GetResult *status = nullptr);

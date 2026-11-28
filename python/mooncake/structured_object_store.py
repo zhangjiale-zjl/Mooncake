@@ -7,6 +7,7 @@ import io
 import json
 import sys
 import uuid
+from bisect import bisect_right
 from collections.abc import MutableMapping
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -33,8 +34,6 @@ from mooncake._structured_ranges import (
     execute_ranges as _execute_member_ranges,
     prepare_ranges as _prepare_member_ranges,
 )
-from mooncake.store import ReplicateConfig
-
 import msgpack as _msgpack
 
 # -- C fast-path: concat_arrays_into(list[ndarray], dest_ptr) ----------------
@@ -4037,7 +4036,7 @@ class _StructuredObjectLayer:
         )
         if read_plan.byte_length == 0:
             return target
-        destination_view = target.view(np.uint8).reshape(-1)
+        destination_view = target.reshape(-1).view(np.uint8)
         if read_plan.step == 1:
             self._bundle_store.read_payload_range_into_destination(
                 payload_spec,
@@ -5008,13 +5007,16 @@ class _MooncakePayloadTransport:
             offsets.append(total_bytes)
             output_bytes = ranges[-1][1] + ranges[-1][2] if ranges else 0
             lengths.append(output_bytes)
+            chunks = payload_spec["chunks"]
+            chunk_starts = _chunk_offsets(chunks) if len(ranges) > 1 else None
             for source, destination, size in ranges:
                 physical = _payload_range_fragments(
-                    payload_spec["chunks"],
+                    chunks,
                     source,
                     size,
                     total_bytes + destination,
                     max_fragments - len(fragments) + 1,
+                    chunk_starts,
                 )
                 if sum(part[4] for part in physical) != size:
                     return None
@@ -5932,11 +5934,16 @@ def _payload_range_fragments(
     byte_length: int,
     destination_offset: int = 0,
     max_fragments: int | None = None,
+    chunk_starts: Sequence[int] | None = None,
 ) -> list[tuple[str, int, int, int, int]]:
     fragments: list[tuple[str, int, int, int, int]] = []
     read_end = byte_offset + byte_length
-    chunk_offset = 0
-    for chunk in chunks:
+    first = max(0, bisect_right(chunk_starts, byte_offset) - 1) if chunk_starts else 0
+    chunk_offset = chunk_starts[first] if chunk_starts else 0
+    for index in range(first, len(chunks)):
+        if chunk_offset >= read_end:
+            break
+        chunk = chunks[index]
         chunk_size = int(chunk["bytes"])
         chunk_end = chunk_offset + chunk_size
         overlap_start = max(byte_offset, chunk_offset)
@@ -6051,11 +6058,13 @@ def _encode_structured_field(value: Any) -> tuple[dict[str, Any], Any]:
     if _torch is not None and isinstance(value, _torch.Tensor):
         return _encode_torch_tensor_field(value)
     if isinstance(value, np.ndarray):
+        # np.ascontiguousarray promotes 0-D inputs to shape (1,).
+        # Keep the original shape in metadata and use array for payload bytes.
         array = np.ascontiguousarray(value)
         return {
             "encoding": "ndarray",
             "dtype": array.dtype.str,
-            "shape": list(array.shape),
+            "shape": list(value.shape),
         }, array.view(np.uint8).reshape(-1)
     return {"encoding": "bytes"}, value
 
@@ -6593,7 +6602,7 @@ def _decode_msgpack_ragged_values(payload: dict[str, Any], rows: int) -> list[An
         )
     raw_data = bytes(data) if not isinstance(data, bytes) else data
     if rows == 0 or not bool(nulls.any()):
-        unpacker = _msgpack.Unpacker(raw=False)
+        unpacker = _msgpack.Unpacker(raw=False, strict_map_key=False)
         unpacker.feed(raw_data)
         values = list(unpacker)
         if len(values) != rows:
@@ -6601,7 +6610,7 @@ def _decode_msgpack_ragged_values(payload: dict[str, Any], rows: int) -> list[An
                 f"msgpack_ragged decoded {len(values)} rows, expected {rows}"
             )
         return values
-    unpacker = _msgpack.Unpacker(raw=False)
+    unpacker = _msgpack.Unpacker(raw=False, strict_map_key=False)
     unpacker.feed(raw_data)
     non_null_iter = iter(unpacker)
     values = []
@@ -6975,6 +6984,11 @@ def _copy_write_config(config: Any) -> Any:
 
 
 def _config_with_group_id(config: Any, group_id: str) -> Any:
+    # Imported lazily at the sole call site so the planning and raw-read
+    # helpers stay importable without a native store build, matching the
+    # CPU contracts CI lane.
+    from mooncake.store import ReplicateConfig
+
     configured_ids = getattr(_config_for_grouped_keys(config, 1), "group_ids", None)
     if configured_ids and configured_ids[0] and configured_ids[0] != group_id:
         raise ValueError("config.group_ids conflicts with the DataProto storage group")
