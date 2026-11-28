@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use mooncake_store_core::{
-    ClientLease, ClientLifecycleState, ColdTierDeviceState, ObjectKey, ObjectRoute, ReplicaTier,
-    SegmentAnnouncement, SegmentLifecycleState,
+    ClientLease, ClientLifecycleState, ColdTierDeviceState, SegmentAnnouncement,
+    SegmentLifecycleState,
 };
 
 use super::process::ProcessSnapshot;
@@ -35,6 +35,10 @@ pub(crate) const MEMBERSHIP_REFRESH_TOTAL: &str = "mooncake_store_membership_ref
 pub(crate) const MEMBERSHIP_REFRESH_DURATION: &str =
     "mooncake_store_membership_refresh_duration_seconds";
 pub(crate) const ROUTE_CAS_TOTAL: &str = "mooncake_store_route_cas_total";
+pub(crate) const DELETE_MARKER_ENTRIES: &str = "mooncake_store_delete_marker_entries";
+pub(crate) const DELETE_MARKER_BYTES: &str = "mooncake_store_delete_marker_bytes";
+pub(crate) const DELETE_MARKER_BUDGET_BYTES: &str = "mooncake_store_delete_marker_budget_bytes";
+pub(crate) const DELETE_MARKER_EVENT_TOTAL: &str = "mooncake_store_delete_marker_event_total";
 pub(crate) const REPLICATION_PUBLISH_TOTAL: &str = "mooncake_store_replication_publish_total";
 pub(crate) const REPLICATION_PUBLISH_DURATION: &str =
     "mooncake_store_replication_publish_duration_seconds";
@@ -50,8 +54,12 @@ pub(crate) const REBALANCE_ROUTES_TOTAL: &str = "mooncake_store_rebalance_routes
 pub(crate) const REBALANCE_BYTES_TOTAL: &str = "mooncake_store_rebalance_bytes_total";
 pub(crate) const SEGMENT_LIFECYCLE_TOTAL: &str = "mooncake_store_segment_lifecycle_total";
 pub(crate) const RECLAIM_RELEASE_TOTAL: &str = "mooncake_store_reclaim_release_total";
+pub(crate) const EVICTION_GUARD_EVENT_TOTAL: &str = "mooncake_store_eviction_guard_event_total";
+pub(crate) const EVICTION_GUARD_PENDING_TOTAL: &str = "mooncake_store_eviction_guard_pending_total";
 pub(crate) const EVICTION_TOTAL: &str = "mooncake_store_eviction_total";
 pub(crate) const EVICTION_DURATION: &str = "mooncake_store_eviction_duration_seconds";
+pub(crate) const EVICTED_REPLICAS_TOTAL: &str = "mooncake_store_evicted_replicas_total";
+pub(crate) const EVICTED_BYTES_TOTAL: &str = "mooncake_store_evicted_bytes_total";
 pub(crate) const TRANSPORT_OPERATION_TOTAL: &str = "mooncake_store_transport_operation_total";
 pub(crate) const TRANSPORT_BYTES_TOTAL: &str = "mooncake_store_transport_bytes_total";
 pub(crate) const METADATA_OPERATION_TOTAL: &str = "mooncake_store_metadata_operation_total";
@@ -103,6 +111,10 @@ pub struct MetricsSnapshot {
     pub membership_refresh: Vec<CounterSample<ResultKey>>,
     pub membership_refresh_duration: Vec<HistogramSample<ResultKey>>,
     pub route_cas: Vec<CounterSample<ResultKey>>,
+    pub delete_marker_entries: u64,
+    pub delete_marker_bytes: u64,
+    pub delete_marker_budget_bytes: u64,
+    pub delete_marker_events: Vec<CounterSample<ResultKey>>,
     pub replication_publish: Vec<CounterSample<ResultKey>>,
     pub replication_publish_duration: Vec<HistogramSample<ResultKey>>,
     pub checksum_validation: Vec<CounterSample<ResultKey>>,
@@ -116,8 +128,12 @@ pub struct MetricsSnapshot {
     pub rebalance_bytes: Vec<CounterSample<PhaseKey>>,
     pub segment_lifecycle: Vec<CounterSample<ActionResultKey>>,
     pub reclaim_release: Vec<CounterSample<ActionResultKey>>,
+    pub eviction_guard_events: Vec<CounterSample<PhaseResultKey>>,
+    pub eviction_guard_pending: Vec<GaugeSample<PhaseKey>>,
     pub eviction: Vec<CounterSample<ResultKey>>,
     pub eviction_duration: Vec<HistogramSample<ResultKey>>,
+    pub evicted_replicas: u64,
+    pub evicted_bytes: u64,
     pub transport_operations: Vec<CounterSample<TransportOperationKey>>,
     pub transport_bytes: Vec<CounterSample<TransportBytesKey>>,
     pub metadata_operations: Vec<CounterSample<MetadataOperationKey>>,
@@ -417,6 +433,23 @@ impl<K: Ord + Clone> GaugeFamily<K> {
             })
             .collect()
     }
+
+    fn snapshot_with_defaults<I>(&self, defaults: I) -> Vec<GaugeSample<K>>
+    where
+        I: IntoIterator<Item = K>,
+    {
+        let mut inner = self.inner.clone();
+        for key in defaults {
+            inner.entry(key).or_default();
+        }
+        inner
+            .iter()
+            .map(|(key, value)| GaugeSample {
+                key: key.clone(),
+                value: *value,
+            })
+            .collect()
+    }
 }
 
 pub(crate) struct HistogramFamily<K> {
@@ -520,13 +553,16 @@ struct MetricsRegistry {
     request_inflight: GaugeFamily<RequestInflightKey>,
     request_duration: HistogramFamily<RequestKey>,
     segments: BTreeMap<(String, String), SegmentSample>,
-    routes: BTreeMap<String, ObjectRoute>,
     runtime_leases: BTreeMap<String, RuntimeLeaseMetric>,
     heartbeat_consecutive_failures: GaugeFamily<RuntimeKey>,
     heartbeat_last_success_ms: GaugeFamily<RuntimeKey>,
     membership_refresh: CounterFamily<ResultKey>,
     membership_refresh_duration: HistogramFamily<ResultKey>,
     route_cas: CounterFamily<ResultKey>,
+    delete_marker_entries: u64,
+    delete_marker_bytes: u64,
+    delete_marker_budget_bytes: u64,
+    delete_marker_events: CounterFamily<ResultKey>,
     replication_publish: CounterFamily<ResultKey>,
     replication_publish_duration: HistogramFamily<ResultKey>,
     checksum_validation: CounterFamily<ResultKey>,
@@ -540,8 +576,12 @@ struct MetricsRegistry {
     rebalance_bytes: CounterFamily<PhaseKey>,
     segment_lifecycle: CounterFamily<ActionResultKey>,
     reclaim_release: CounterFamily<ActionResultKey>,
+    eviction_guard_events: CounterFamily<PhaseResultKey>,
+    eviction_guard_pending: GaugeFamily<PhaseKey>,
     eviction: CounterFamily<ResultKey>,
     eviction_duration: HistogramFamily<ResultKey>,
+    evicted_replicas: u64,
+    evicted_bytes: u64,
     transport_operations: CounterFamily<TransportOperationKey>,
     transport_bytes: CounterFamily<TransportBytesKey>,
     metadata_operations: CounterFamily<MetadataOperationKey>,
@@ -599,13 +639,16 @@ impl Default for MetricsRegistry {
             request_inflight: GaugeFamily::default(),
             request_duration: HistogramFamily::default(),
             segments: BTreeMap::new(),
-            routes: BTreeMap::new(),
             runtime_leases: BTreeMap::new(),
             heartbeat_consecutive_failures: GaugeFamily::default(),
             heartbeat_last_success_ms: GaugeFamily::default(),
             membership_refresh: CounterFamily::default(),
             membership_refresh_duration: HistogramFamily::default(),
             route_cas: CounterFamily::default(),
+            delete_marker_entries: 0,
+            delete_marker_bytes: 0,
+            delete_marker_budget_bytes: 0,
+            delete_marker_events: CounterFamily::default(),
             replication_publish: CounterFamily::default(),
             replication_publish_duration: HistogramFamily::default(),
             checksum_validation: CounterFamily::default(),
@@ -619,8 +662,12 @@ impl Default for MetricsRegistry {
             rebalance_bytes: CounterFamily::default(),
             segment_lifecycle: CounterFamily::default(),
             reclaim_release: CounterFamily::default(),
+            eviction_guard_events: CounterFamily::default(),
+            eviction_guard_pending: GaugeFamily::default(),
             eviction: CounterFamily::default(),
             eviction_duration: HistogramFamily::default(),
+            evicted_replicas: 0,
+            evicted_bytes: 0,
             transport_operations: CounterFamily::default(),
             transport_bytes: CounterFamily::default(),
             metadata_operations: CounterFamily::default(),
@@ -691,7 +738,6 @@ impl SharedMetricsRegistry {
         self.inner.lock().expect("metrics lock poisoned")
     }
 
-    #[cfg(test)]
     fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
@@ -787,8 +833,8 @@ impl MetricsRegistry {
             request_inflight: self.request_inflight.snapshot(),
             request_duration: self.request_duration.snapshot(),
             segments: self.segments.values().cloned().collect(),
-            object_routes: self.object_route_snapshot(),
-            replica_distribution: self.replica_distribution_snapshot(),
+            object_routes: Vec::new(),
+            replica_distribution: Vec::new(),
             runtime_status: self.runtime_status_snapshot(),
             runtime_lease_expires_at_ms: self.runtime_lease_snapshot(),
             heartbeat_consecutive_failures: self.heartbeat_consecutive_failures.snapshot(),
@@ -796,6 +842,10 @@ impl MetricsRegistry {
             membership_refresh: self.membership_refresh.snapshot(),
             membership_refresh_duration: self.membership_refresh_duration.snapshot(),
             route_cas: self.route_cas.snapshot(),
+            delete_marker_entries: self.delete_marker_entries,
+            delete_marker_bytes: self.delete_marker_bytes,
+            delete_marker_budget_bytes: self.delete_marker_budget_bytes,
+            delete_marker_events: self.delete_marker_events.snapshot(),
             replication_publish: self.replication_publish.snapshot(),
             replication_publish_duration: self.replication_publish_duration.snapshot(),
             checksum_validation: self.checksum_validation.snapshot(),
@@ -829,8 +879,16 @@ impl MetricsRegistry {
             reclaim_release: self
                 .reclaim_release
                 .snapshot_with_defaults(reclaim_release_keys()),
+            eviction_guard_events: self
+                .eviction_guard_events
+                .snapshot_with_defaults(eviction_guard_event_keys()),
+            eviction_guard_pending: self
+                .eviction_guard_pending
+                .snapshot_with_defaults(phase_keys(EVICTION_GUARD_PENDING_PHASES)),
             eviction: self.eviction.snapshot(),
             eviction_duration: self.eviction_duration.snapshot(),
+            evicted_replicas: self.evicted_replicas,
+            evicted_bytes: self.evicted_bytes,
             transport_operations: self.transport_operations.snapshot(),
             transport_bytes: self.transport_bytes.snapshot(),
             metadata_operations: self.metadata_operations.snapshot(),
@@ -882,42 +940,6 @@ impl MetricsRegistry {
             batch_is_exist_duration: self.batch_is_exist_duration.snapshot(),
             process,
         }
-    }
-
-    fn object_route_snapshot(&self) -> Vec<GaugeSample<TenantKey>> {
-        let mut by_tenant = BTreeMap::<String, u64>::new();
-        for route in self.routes.values() {
-            let tenant = object_key_tenant(&route.key.0);
-            *by_tenant.entry(tenant.to_string()).or_default() += 1;
-        }
-        by_tenant
-            .into_iter()
-            .map(|(tenant, value)| GaugeSample {
-                key: TenantKey { tenant },
-                value: value as f64,
-            })
-            .collect()
-    }
-
-    fn replica_distribution_snapshot(&self) -> Vec<GaugeSample<ReplicaDistributionKey>> {
-        let mut by_runtime = BTreeMap::<ReplicaDistributionKey, u64>::new();
-        for route in self.routes.values() {
-            for replica in &route.replicas {
-                *by_runtime
-                    .entry(ReplicaDistributionKey {
-                        runtime: replica.owner.to_string(),
-                        tier: replica_tier_label(replica.tier),
-                    })
-                    .or_default() += 1;
-            }
-        }
-        by_runtime
-            .into_iter()
-            .map(|(key, value)| GaugeSample {
-                key,
-                value: value as f64,
-            })
-            .collect()
     }
 
     fn runtime_status_snapshot(&self) -> Vec<GaugeSample<RuntimeStatusKey>> {
@@ -973,6 +995,31 @@ const RECLAIM_RELEASE_RESULTS: &[&str] = &[
     "skipped_missing_runtime_lease",
     "error",
 ];
+const EVICTION_GUARD_PENDING_PHASES: &[&str] = &[
+    "prepared",
+    "ready_to_commit",
+    "pending_confirmation",
+    "pending_allocation_confirmation",
+];
+const EVICTION_GUARD_EVENT_OUTCOMES: &[(&str, &str)] = &[
+    ("route_cas", "outcome_unknown"),
+    ("clock_candidate", "pending_confirmation"),
+    ("allocator_candidate", "pending_confirmation"),
+    ("pending_token", "aborted"),
+    ("local_commit", "release_deferred"),
+    ("local_commit", "released"),
+    ("local_commit", "identity_replaced"),
+    ("route_confirmation", "referenced"),
+    ("route_confirmation", "absent"),
+    ("route_confirmation", "indeterminate"),
+    ("allocation_confirmation", "absent"),
+    ("allocation_confirmation", "referenced"),
+    ("allocation_confirmation", "conflict"),
+    ("allocation_confirmation", "invalid_response"),
+    ("allocation_confirmation", "indeterminate"),
+    ("reservation_rollback", "queued"),
+    ("reservation_rollback", "released"),
+];
 
 fn result_keys(results: &'static [&'static str]) -> impl Iterator<Item = ResultKey> {
     results.iter().copied().map(|result| ResultKey { result })
@@ -990,6 +1037,12 @@ fn phase_result_keys(
         .iter()
         .copied()
         .map(move |result| PhaseResultKey { phase, result })
+}
+
+fn eviction_guard_event_keys() -> impl Iterator<Item = PhaseResultKey> {
+    EVICTION_GUARD_EVENT_OUTCOMES
+        .iter()
+        .map(|(phase, result)| PhaseResultKey { phase, result })
 }
 
 fn preferred_segment_skip_keys() -> impl Iterator<Item = PreferredSegmentSkipKey> {
@@ -1132,6 +1185,23 @@ pub(crate) fn record_route_cas(result: &'static str) {
         .lock()
         .route_cas
         .add(ResultKey { result }, 1);
+}
+
+pub(crate) fn record_delete_marker_state(entries: u64, bytes: u64, budget_bytes: u64) {
+    let mut registry = global_metrics_registry().lock();
+    registry.delete_marker_entries = entries;
+    registry.delete_marker_bytes = bytes;
+    registry.delete_marker_budget_bytes = budget_bytes;
+}
+
+pub(crate) fn record_delete_marker_event(event: &'static str, count: u64) {
+    if count == 0 {
+        return;
+    }
+    global_metrics_registry()
+        .lock()
+        .delete_marker_events
+        .add(ResultKey { result: event }, count);
 }
 
 pub(crate) fn record_replication_publish(result: &'static str, duration: Duration) {
@@ -1381,17 +1451,6 @@ pub(crate) fn record_segment_removed(announcement: &SegmentAnnouncement) {
         .insert((sample.runtime.clone(), sample.segment.clone()), sample);
 }
 
-pub(crate) fn record_route(route: &ObjectRoute) {
-    global_metrics_registry()
-        .lock()
-        .routes
-        .insert(route.key.0.clone(), route.clone());
-}
-
-pub(crate) fn remove_route(key: &ObjectKey) {
-    global_metrics_registry().lock().routes.remove(&key.0);
-}
-
 pub(crate) fn record_segment_lifecycle(action: &'static str, result: &'static str) {
     global_metrics_registry()
         .lock()
@@ -1405,6 +1464,23 @@ pub(crate) fn record_reclaim_release(action: &'static str, result: &'static str)
         .lock()
         .reclaim_release
         .add(ActionResultKey { action, result }, 1);
+}
+
+pub(crate) fn record_eviction_guard_event(source: &'static str, outcome: &'static str) {
+    global_metrics_registry().lock().eviction_guard_events.add(
+        PhaseResultKey {
+            phase: source,
+            result: outcome,
+        },
+        1,
+    );
+}
+
+pub(crate) fn set_eviction_guard_pending(phase: &'static str, count: usize) {
+    global_metrics_registry()
+        .lock()
+        .eviction_guard_pending
+        .set(PhaseKey { phase }, count as f64);
 }
 
 pub(crate) struct ColdTierDeviceMetrics<'a> {
@@ -1443,6 +1519,12 @@ pub(crate) fn record_eviction(result: &'static str, duration: Duration) {
     registry
         .eviction_duration
         .observe(key, duration.as_secs_f64());
+}
+
+pub(crate) fn record_evicted_replicas(replicas: usize, bytes: u64) {
+    let mut registry = global_metrics_registry().lock();
+    registry.evicted_replicas = registry.evicted_replicas.saturating_add(replicas as u64);
+    registry.evicted_bytes = registry.evicted_bytes.saturating_add(bytes);
 }
 
 pub(crate) fn record_cold_tier_device_metrics(metrics: ColdTierDeviceMetrics<'_>) {
@@ -1764,14 +1846,21 @@ pub(crate) fn snapshot_metrics_with_registry(
     registry: &SharedMetricsRegistry,
     process: ProcessSnapshot,
 ) -> MetricsSnapshot {
+    let is_global = registry.ptr_eq(global_metrics_registry());
+    // Route mutations can call the event sink under an authority write lock.
+    // Collect authority gauges before taking the global metrics mutex.
+    let gauges = is_global.then(mooncake_store_route::snapshot_route_gauges);
     #[cfg(test)]
-    if registry.ptr_eq(global_metrics_registry()) {
-        return registry
-            .lock()
-            .snapshot_with_tenant(process, test_process_tenant_label());
+    let tenant_override = is_global.then(test_process_tenant_label).flatten();
+    #[cfg(not(test))]
+    let tenant_override = None;
+    let mut snapshot = registry
+        .lock()
+        .snapshot_with_tenant(process, tenant_override);
+    if let Some(gauges) = gauges {
+        apply_route_gauges(&mut snapshot, gauges);
     }
-
-    registry.lock().snapshot(process)
+    snapshot
 }
 
 #[cfg(test)]
@@ -1826,13 +1915,6 @@ fn segment_identity(announcement: &SegmentAnnouncement) -> (String, String) {
     )
 }
 
-fn object_key_tenant(key: &str) -> &str {
-    key.split_once("::")
-        .or_else(|| key.split_once('/'))
-        .map(|(tenant, _)| tenant)
-        .unwrap_or("default")
-}
-
 fn segment_sample(announcement: &SegmentAnnouncement) -> SegmentSample {
     SegmentSample {
         runtime: announcement.owner.to_string(),
@@ -1862,15 +1944,6 @@ fn client_state_label(state: ClientLifecycleState) -> &'static str {
     }
 }
 
-fn replica_tier_label(tier: ReplicaTier) -> &'static str {
-    match tier {
-        ReplicaTier::Dram => "dram",
-        ReplicaTier::Nvme => "nvme",
-        ReplicaTier::File => "file",
-        ReplicaTier::Unknown => "unknown",
-    }
-}
-
 fn cold_tier_device_state_label(state: ColdTierDeviceState) -> &'static str {
     match state {
         ColdTierDeviceState::Unregistered => "unregistered",
@@ -1879,5 +1952,97 @@ fn cold_tier_device_state_label(state: ColdTierDeviceState) -> &'static str {
         ColdTierDeviceState::DisabledByAdmin => "disabled_by_admin",
         ColdTierDeviceState::Draining => "draining",
         ColdTierDeviceState::Failed => "failed",
+    }
+}
+
+fn apply_route_gauges(
+    snapshot: &mut MetricsSnapshot,
+    gauges: mooncake_store_route::RouteGaugeSnapshot,
+) {
+    snapshot.object_routes = gauges
+        .objects_by_tenant
+        .into_iter()
+        .map(|(tenant, count)| GaugeSample {
+            key: TenantKey { tenant },
+            value: count as f64,
+        })
+        .collect();
+    snapshot.replica_distribution = gauges
+        .replicas_by_runtime
+        .into_iter()
+        .flat_map(|(runtime, tiers)| {
+            let runtime = runtime.to_string();
+            tiers.into_iter().map(move |(tier, count)| GaugeSample {
+                key: ReplicaDistributionKey {
+                    runtime: runtime.clone(),
+                    tier,
+                },
+                value: count as f64,
+            })
+        })
+        .collect();
+    // Preserve the existing ordering by exported label, including numeric epochs.
+    snapshot
+        .replica_distribution
+        .sort_by(|left, right| left.key.cmp(&right.key));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mooncake_store_core::{ClientEpoch, ClientRuntimeId};
+    use mooncake_store_route::RouteGaugeSnapshot;
+
+    #[test]
+    fn route_gauge_export_preserves_labels_counts_and_order() {
+        let gauges = RouteGaugeSnapshot {
+            objects_by_tenant: BTreeMap::from([
+                ("tenant-a".to_string(), 3),
+                ("default".to_string(), 1),
+            ]),
+            replicas_by_runtime: BTreeMap::from([
+                (
+                    ClientRuntimeId::new("owner", ClientEpoch(2)),
+                    BTreeMap::from([("dram", 2)]),
+                ),
+                (
+                    ClientRuntimeId::new("owner", ClientEpoch(10)),
+                    BTreeMap::from([("dram", 1), ("nvme", 3)]),
+                ),
+            ]),
+        };
+        let mut snapshot = MetricsSnapshot::default();
+        apply_route_gauges(&mut snapshot, gauges);
+        assert_eq!(
+            snapshot
+                .object_routes
+                .iter()
+                .map(|sample| (sample.key.tenant.as_str(), sample.value))
+                .collect::<Vec<_>>(),
+            vec![("default", 1.0), ("tenant-a", 3.0)]
+        );
+        assert_eq!(
+            snapshot
+                .replica_distribution
+                .iter()
+                .map(|sample| (sample.key.runtime.as_str(), sample.key.tier, sample.value))
+                .collect::<Vec<_>>(),
+            vec![
+                ("owner:10", "dram", 1.0),
+                ("owner:10", "nvme", 3.0),
+                ("owner:2", "dram", 2.0),
+            ]
+        );
+        apply_route_gauges(&mut snapshot, RouteGaugeSnapshot::default());
+        assert!(snapshot.object_routes.is_empty());
+        assert!(snapshot.replica_distribution.is_empty());
+    }
+
+    #[test]
+    fn private_metrics_registry_does_not_collect_process_route_gauges() {
+        let registry = new_metrics_registry();
+        let snapshot = snapshot_metrics_with_registry(&registry, ProcessSnapshot::default());
+        assert!(snapshot.object_routes.is_empty());
+        assert!(snapshot.replica_distribution.is_empty());
     }
 }

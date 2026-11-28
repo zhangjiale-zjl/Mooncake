@@ -65,6 +65,7 @@ class MooncakeTransferEngineReader:
         self,
         engine: Any,
         *,
+        transfer_executor: MooncakeTransferEngineExecutor | None = None,
         max_batch_operations: int = 1024,
         max_region_segments: int = 1_000_000,
         max_total_lowered_segments: int = 10_000_000,
@@ -80,6 +81,22 @@ class MooncakeTransferEngineReader:
             max_completion_drain_attempts=max_completion_drain_attempts,
             completion_drain_timeout_ms=completion_drain_timeout_ms,
         )
+        if transfer_executor is not None:
+            if not isinstance(transfer_executor, MooncakeTransferEngineExecutor):
+                raise ValueError(
+                    "transfer_executor must be a MooncakeTransferEngineExecutor"
+                )
+            if transfer_executor.engine is not engine:
+                raise ValueError("transfer_executor must use the same engine")
+            if transfer_executor.pending_transfer_ids():
+                raise ValueError("transfer_executor must have no pending transfers")
+            if (
+                transfer_executor.max_completion_drain_attempts
+                != max_completion_drain_attempts
+                or transfer_executor.completion_drain_timeout_ms
+                != completion_drain_timeout_ms
+            ):
+                raise ValueError("transfer_executor drain settings must match reader")
         self.engine = engine
         self.max_batch_operations = max_batch_operations
         self.max_region_segments = max_region_segments
@@ -87,10 +104,14 @@ class MooncakeTransferEngineReader:
         self.max_inflight_batches = max_inflight_batches
         self.max_completion_drain_attempts = max_completion_drain_attempts
         self.completion_drain_timeout_ms = completion_drain_timeout_ms
-        self.transfer_executor = MooncakeTransferEngineExecutor(
-            engine,
-            max_completion_drain_attempts=max_completion_drain_attempts,
-            completion_drain_timeout_ms=completion_drain_timeout_ms,
+        self.transfer_executor = (
+            MooncakeTransferEngineExecutor(
+                engine,
+                max_completion_drain_attempts=max_completion_drain_attempts,
+                completion_drain_timeout_ms=completion_drain_timeout_ms,
+            )
+            if transfer_executor is None
+            else transfer_executor
         )
 
     def execute(
@@ -320,8 +341,9 @@ class MooncakeTransferEngineReader:
                         f"duplicate source executor rank and worker: {executor_key}"
                     )
                 source_executor_keys.add(executor_key)
+            required_fragment_id_set = frozenset(required_fragment_ids)
             for fragment in binding.fragments:
-                if fragment.fragment_id not in required_fragment_ids:
+                if fragment.fragment_id not in required_fragment_id_set:
                     continue
                 if fragment.fragment_id in sources:
                     raise TransferEngineError(

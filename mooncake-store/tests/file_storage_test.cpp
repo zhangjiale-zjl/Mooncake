@@ -2,15 +2,24 @@
 #include <gtest/gtest.h>
 #include <sys/stat.h>
 
+#include <algorithm>
+#include <atomic>
+#include <barrier>
+#include <cerrno>
 #include <chrono>
-#include <cstring>
+#include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <unordered_set>
+#include <variant>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "allocator.h"
 #include "client_metric.h"
@@ -71,6 +80,78 @@ class ConcurrentOffloadBackend : public BucketStorageBackend {
     bool fail_write_;
 };
 
+// Fails every read the way BucketStorageBackend does when preadv fails:
+// the errno goes to the disk-error observer, FILE_READ_FAIL to the caller.
+class FailingReadBackend : public BucketStorageBackend {
+   public:
+    FailingReadBackend(const FileStorageConfig& config,
+                       const BucketBackendConfig& bucket_config, int read_errno)
+        : BucketStorageBackend(config, bucket_config),
+          read_errno_(read_errno) {}
+
+    void SetDiskErrorObserver(DiskErrorObserver observer) override {
+        observer_ = std::move(observer);
+    }
+
+    tl::expected<void, ErrorCode> BatchLoad(
+        std::unordered_map<std::string, Slice>&) override {
+        ++loads;
+        observer_(read_errno_, "preadv");
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    tl::expected<void, ErrorCode> BatchLoadSpans(
+        std::unordered_map<std::string, StorageValueSpan>&) override {
+        ++span_loads;
+        observer_(read_errno_, "preadv");
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    tl::expected<int64_t, ErrorCode> BatchOffload(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch,
+        std::function<ErrorCode(const std::vector<std::string>&,
+                                std::vector<StorageObjectMetadata>&)>
+            complete,
+        EvictionHandler eviction = nullptr) override {
+        ++offloads;
+        return BucketStorageBackend::BatchOffload(batch, std::move(complete),
+                                                  std::move(eviction));
+    }
+
+    int loads = 0;
+    int span_loads = 0;
+    int offloads = 0;
+
+   private:
+    int read_errno_;
+    DiskErrorObserver observer_;
+};
+
+class DelayedReadBackend : public BucketStorageBackend {
+   public:
+    using BucketStorageBackend::BucketStorageBackend;
+
+    tl::expected<void, ErrorCode> BatchLoad(
+        std::unordered_map<std::string, Slice>& slices) override {
+        ++loads;
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        return BucketStorageBackend::BatchLoad(slices);
+    }
+
+    std::atomic<size_t> loads{0};
+};
+
+enum class ReclaimCase {
+    kRemoved,
+    kRePut,
+    kRetriedTask,
+    kSegmentLost,
+    kSegmentRemounted,
+    kQueryFails,
+    kExistingData,
+    kOffloadFails
+};
+
 class FileStorageTest : public ::testing::Test {
    protected:
     std::string data_path;
@@ -84,6 +165,226 @@ class FileStorageTest : public ::testing::Test {
             bytes += static_cast<uintmax_t>(info.st_blocks) * 512;
         }
         return bytes;
+    }
+
+    // Fails every write while `fail` is set, like a full disk.
+    class FailingWriteBackend : public BucketStorageBackend {
+       public:
+        using BucketStorageBackend::BucketStorageBackend;
+        tl::expected<int64_t, ErrorCode> BatchOffload(
+            const std::unordered_map<std::string, std::vector<Slice>>& batch,
+            std::function<ErrorCode(const std::vector<std::string>&,
+                                    std::vector<StorageObjectMetadata>&)>
+                complete,
+            EvictionHandler eviction = nullptr) override {
+            if (fail.load()) {
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            }
+            return BucketStorageBackend::BatchOffload(
+                batch, std::move(complete), std::move(eviction));
+        }
+        std::atomic<bool> fail{false};
+    };
+
+    void RunReclaimScenario(ReclaimCase reclaim_case) {
+        testing::InProcMaster master;
+        ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                     .set_enable_offload(true)
+                                     .set_default_kv_lease_ttl(0)
+                                     .set_root_fs_dir("")
+                                     .build()));
+        constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+        constexpr size_t kSize = 128;
+        std::unique_ptr<void, decltype(&std::free)> segment(
+            allocate_buffer_allocator_memory(kSegmentSize), &std::free);
+        ASSERT_NE(segment, nullptr);
+        SimpleAllocator allocator(kSegmentSize);
+        const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+        auto created = Client::Create(endpoint, master.metadata_url(), "tcp",
+                                      std::nullopt, master.master_address());
+        ASSERT_TRUE(created);
+        auto client = *created;
+        ASSERT_TRUE(client->MountSegment(segment.get(), kSegmentSize, "tcp"));
+        ASSERT_TRUE(client->RegisterLocalMemory(
+            allocator.getBase(), kSegmentSize, "cpu:0", false, false));
+        ASSERT_TRUE(client->MountLocalDiskSegment(true));
+
+        const std::string key = "reclaim-key";
+        const auto storage_key = TenantId::Default().MakeScopedKey(key);
+        auto put = [&](char fill, const std::string& put_key = "reclaim-key") {
+            auto* buffer = allocator.allocate(kSize);
+            ASSERT_NE(buffer, nullptr);
+            std::memset(buffer, fill, kSize);
+            ReplicateConfig replicate;
+            replicate.replica_num = 1;
+            std::vector<Slice> slices{{buffer, kSize}};
+            ASSERT_TRUE(client->Put(put_key, slices, replicate));
+            allocator.deallocate(buffer, kSize);
+        };
+        auto drain_tasks = [&] {
+            std::vector<OffloadTaskItem> tasks;
+            EXPECT_TRUE(client->OffloadObjectHeartbeat(true, tasks));
+            return tasks;
+        };
+
+        FileStorageConfig config = FileStorageConfig::FromEnvironment();
+        config.storage_filepath = data_path + "/reclaim";
+        config.local_buffer_size = 1024 * 1024;
+        config.reclaim_interval_seconds = 1;
+        config.reclaim_cycle_seconds = 1;
+        fs::create_directories(config.storage_filepath);
+        FileStorage storage(config, client, endpoint);
+        BucketBackendConfig bucket_config;
+        bucket_config.bucket_keys_limit = 1;
+        auto backend =
+            std::make_shared<FailingWriteBackend>(config, bucket_config);
+        storage.storage_backend_ = backend;
+        ASSERT_TRUE(backend->Init());
+        const auto baseline = StoredFileBytes(config.storage_filepath);
+
+        auto bucket_of = [&]() -> std::optional<int64_t> {
+            std::unordered_map<std::string, StorageObjectMetadata> metadata;
+            if (!backend->GetObjectDataSize(storage_key) ||
+                !backend->BatchQuery({storage_key}, metadata)) {
+                return std::nullopt;
+            }
+            return metadata.at(storage_key).bucket_id;
+        };
+        auto local_value = [&]() -> std::string {
+            std::string actual(kSize, '\0');
+            std::unordered_map<std::string, Slice> read{
+                {storage_key, {actual.data(), actual.size()}}};
+            return backend->BatchLoad(read) ? actual : std::string();
+        };
+        auto master_has_our_replica = [&] {
+            auto query = client->Query(key);
+            if (!query) return false;
+            return std::any_of(query->replicas.begin(), query->replicas.end(),
+                               [&](const Replica::Descriptor& replica) {
+                                   const auto* disk =
+                                       std::get_if<LocalDiskDescriptor>(
+                                           &replica.descriptor_variant);
+                                   return disk != nullptr &&
+                                          disk->transport_endpoint == endpoint;
+                               });
+        };
+        auto reclaim_twice = [&] {
+            for (int i = 0; i < 2; ++i) {
+                storage.next_reclaim_at_ = {};
+                storage.ReclaimRemovedObjects();
+            }
+        };
+
+        put('o');
+        auto tasks = drain_tasks();
+        ASSERT_EQ(1, tasks.size());
+        ASSERT_TRUE(storage.OffloadObjects(tasks));
+        const auto first_bucket = bucket_of();
+        ASSERT_TRUE(first_bucket);
+        ASSERT_TRUE(master_has_our_replica());
+        const auto populated = StoredFileBytes(config.storage_filepath);
+        ASSERT_GT(populated, baseline);
+
+        switch (reclaim_case) {
+            case ReclaimCase::kRemoved:
+                ASSERT_TRUE(client->Remove(key, true));
+                // The first tick records the verdict, the next one acts.
+                ASSERT_TRUE(storage.Heartbeat());
+                EXPECT_EQ(populated, StoredFileBytes(config.storage_filepath));
+                storage.next_reclaim_at_ = {};
+                ASSERT_TRUE(storage.Heartbeat());
+                EXPECT_FALSE(bucket_of());
+                EXPECT_EQ(baseline, StoredFileBytes(config.storage_filepath));
+                break;
+            case ReclaimCase::kRePut: {
+                ASSERT_TRUE(client->Remove(key, true));
+                put('n');
+                tasks = drain_tasks();
+                ASSERT_EQ(1, tasks.size());
+                ASSERT_TRUE(storage.OffloadObjects(tasks));
+                const auto second_bucket = bucket_of();
+                ASSERT_TRUE(second_bucket);
+                EXPECT_NE(*first_bucket, *second_bucket);
+                EXPECT_EQ(std::string(kSize, 'n'), local_value());
+                EXPECT_TRUE(master_has_our_replica());
+                // The stale bucket goes like any bucket with no live key.
+                reclaim_twice();
+                EXPECT_EQ(second_bucket, bucket_of());
+                EXPECT_EQ(populated, StoredFileBytes(config.storage_filepath));
+                break;
+            }
+            case ReclaimCase::kRetriedTask:
+                std::ignore = storage.OffloadObjects(tasks);
+                EXPECT_EQ(first_bucket, bucket_of());
+                EXPECT_EQ(std::string(kSize, 'o'), local_value());
+                EXPECT_TRUE(master_has_our_replica());
+                EXPECT_EQ(populated, StoredFileBytes(config.storage_filepath));
+                break;
+            case ReclaimCase::kSegmentLost:
+                ASSERT_TRUE(client->Remove(key, true));
+                storage.segment_lost_epoch_.fetch_add(1);
+                reclaim_twice();
+                EXPECT_EQ(first_bucket, bucket_of());
+                storage.rescanned_epoch_.store(
+                    storage.segment_lost_epoch_.load());
+                reclaim_twice();
+                EXPECT_FALSE(bucket_of());
+                EXPECT_EQ(baseline, StoredFileBytes(config.storage_filepath));
+                break;
+            case ReclaimCase::kSegmentRemounted:
+                storage.enable_offloading_ = true;
+                ASSERT_TRUE(client->UnmountLocalDiskSegment());
+                ASSERT_FALSE(master_has_our_replica());
+                ASSERT_TRUE(storage.Heartbeat());
+                EXPECT_EQ(1, storage.segment_lost_epoch_.load());
+                EXPECT_FALSE(storage.MasterKnowsOurObjects());
+                ASSERT_TRUE(storage.rescan_future_.valid());
+                storage.rescan_future_.wait();
+                ASSERT_TRUE(storage.Heartbeat());
+                EXPECT_TRUE(storage.MasterKnowsOurObjects());
+                EXPECT_TRUE(master_has_our_replica());
+                EXPECT_EQ(first_bucket, bucket_of());
+                break;
+            case ReclaimCase::kQueryFails:
+                ASSERT_TRUE(client->Remove(key, true));
+                storage.ReclaimRemovedObjects();
+                ASSERT_EQ(1,
+                          storage.reclaim_dead_keys_.at(*first_bucket).size());
+                master.Stop();
+                storage.next_reclaim_at_ = {};
+                storage.ReclaimRemovedObjects();
+                EXPECT_EQ(first_bucket, bucket_of());
+                EXPECT_TRUE(storage.reclaim_dead_keys_.empty());
+                return;
+            case ReclaimCase::kExistingData: {
+                storage.storage_backend_.reset();
+                backend.reset();
+                FileStorage restarted(config, client, endpoint);
+                ASSERT_TRUE(restarted.Init());
+                ASSERT_TRUE(restarted.Shutdown());
+                EXPECT_TRUE(restarted.reclaim_disabled_);
+                ASSERT_TRUE(client->Remove(key, true));
+                for (int i = 0; i < 2; ++i) {
+                    restarted.next_reclaim_at_ = {};
+                    restarted.ReclaimRemovedObjects();
+                }
+                EXPECT_EQ(populated, StoredFileBytes(config.storage_filepath));
+                break;
+            }
+            case ReclaimCase::kOffloadFails:
+                storage.enable_offloading_ = true;
+                ASSERT_TRUE(client->Remove(key, true));
+                ASSERT_TRUE(storage.Heartbeat());
+                put('x', "other-key");
+                backend->fail.store(true);
+                storage.next_reclaim_at_ = {};
+                EXPECT_FALSE(storage.Heartbeat());
+                EXPECT_FALSE(bucket_of());
+                EXPECT_EQ(baseline, StoredFileBytes(config.storage_filepath));
+                break;
+        }
+        EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
+        EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
     }
 
     void RunOrdinaryRemoveAllReclaimScenario(StorageBackendType backend_type) {
@@ -185,10 +486,20 @@ class FileStorageTest : public ::testing::Test {
                                               .resource_id = "ssd-weight",
                                               .revision = "v1",
                                               .weight_generation = 1};
-        auto begin = client->BeginWeightImport({.identity = identity,
-                                                .payload_group_id = {},
-                                                .expected_payload_count = 1,
-                                                .expected_logical_bytes = 128});
+        auto begin = client->BeginWeightImport({
+            .identity = identity,
+            .payload_group_id = {},
+            .expected_payload_count = 1,
+            .expected_logical_bytes = 128,
+            .policy =
+                WeightStoragePolicy{
+                    .preferred_residency = WeightResidencyState::HOT,
+                    .migration_mode = WeightMigrationMode::MANUAL},
+            .affinity_summary =
+                {.affinity_count = 1,
+                 .affinity_digest = ComputeWeightAffinityMappingSha256(
+                     {{"managed-payload", 128, "payload"}})},
+        });
         ASSERT_TRUE(begin && *begin);
         const auto manifest_key = MakeWeightManifestKey(identity);
         const std::vector<std::string> keys{"ordinary-ssd", "managed-payload",
@@ -206,6 +517,10 @@ class FileStorageTest : public ::testing::Test {
                 config.group_ids = {(*begin)->manifest.payload_group_id};
                 config.data_type =
                     i == 1 ? ObjectDataType::WEIGHT : ObjectDataType::METADATA;
+                if (i == 1) {
+                    config.residency_affinity_ids =
+                        std::vector<std::string>{"payload"};
+                }
             }
             std::vector<Slice> slices{{buffer, values[i].size()}};
             ASSERT_TRUE(client->Put(keys[i], slices, config));
@@ -319,6 +634,73 @@ class FileStorageTest : public ::testing::Test {
         EXPECT_EQ(baseline, StoredFileBytes(config.storage_filepath));
         EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
         EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
+    }
+
+    void RunDeferredHeartbeatTailScenario() {
+        testing::InProcMaster master;
+        ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                     .set_enable_offload(true)
+                                     .set_default_kv_lease_ttl(0)
+                                     .set_root_fs_dir("")
+                                     .build()));
+        constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+        std::unique_ptr<void, decltype(&std::free)> segment(
+            allocate_buffer_allocator_memory(kSegmentSize), &std::free);
+        ASSERT_NE(segment, nullptr);
+        SimpleAllocator allocator(kSegmentSize);
+        const auto endpoint = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+        auto created = Client::Create(endpoint, master.metadata_url(), "tcp",
+                                      std::nullopt, master.master_address());
+        ASSERT_TRUE(created);
+        auto client = created.value();
+        ASSERT_TRUE(client->MountSegment(segment.get(), kSegmentSize, "tcp"));
+        ASSERT_TRUE(client->RegisterLocalMemory(
+            allocator.getBase(), kSegmentSize, "cpu:0", false, false));
+        ASSERT_TRUE(client->MountLocalDiskSegment(true));
+        void* buffer = allocator.allocate(128);
+        ASSERT_NE(buffer, nullptr);
+        std::memset(buffer, 't', 128);
+        std::vector<Slice> slices{{buffer, 128}};
+        ReplicateConfig replicate;
+        replicate.replica_num = 1;
+        ASSERT_TRUE(client->Put("heartbeat-tail", slices, replicate));
+
+        auto config = FileStorageConfig::FromEnvironment();
+        config.storage_backend_type = StorageBackendType::kBucket;
+        config.storage_filepath = data_path + "/heartbeat_tail";
+        config.local_buffer_size = 1024 * 1024;
+        fs::create_directories(config.storage_filepath);
+        FileStorage storage(config, client, endpoint);
+        BucketBackendConfig bucket_config;
+        bucket_config.bucket_keys_limit = 10;
+        bucket_config.flush_partial_buckets = false;
+        auto backend =
+            std::make_shared<BucketStorageBackend>(config, bucket_config);
+        storage.storage_backend_ = backend;
+        ASSERT_TRUE(backend->Init());
+        ASSERT_TRUE(storage.RegisterLocalMemory());
+        storage.enable_offloading_ = true;
+        ASSERT_TRUE(storage.Heartbeat());
+        ASSERT_EQ(1u, storage.deferred_task_by_storage_key_.size());
+        EXPECT_EQ(1u, backend->UngroupedOffloadingObjectsSize());
+        std::vector<OffloadTaskItem> fresh;
+        ASSERT_TRUE(client->OffloadObjectHeartbeat(true, fresh));
+        ASSERT_TRUE(fresh.empty());
+
+        ASSERT_TRUE(storage.Heartbeat());
+        EXPECT_TRUE(storage.deferred_task_by_storage_key_.empty());
+        EXPECT_EQ(0u, backend->UngroupedOffloadingObjectsSize());
+        auto query = client->Query("heartbeat-tail");
+        ASSERT_TRUE(query);
+        EXPECT_EQ(1u,
+                  std::count_if(query->replicas.begin(), query->replicas.end(),
+                                [](const auto& replica) {
+                                    return replica.is_local_disk_replica();
+                                }));
+        std::vector<OffloadTaskItem> remaining;
+        ASSERT_TRUE(client->OffloadObjectHeartbeat(true, remaining));
+        EXPECT_TRUE(remaining.empty());
+        EXPECT_TRUE(client->Upsert("heartbeat-tail", slices, replicate));
     }
 
     void RunDeferredOffloadFailureScenario(bool capacity_limit) {
@@ -606,10 +988,69 @@ class FileStorageTest : public ::testing::Test {
                                          *fileStorage.client_buffer_allocator_);
     }
 
+    size_t ClientBufferBatchCount(FileStorage& fileStorage) {
+        size_t total = 0;
+        for (auto& shard : fileStorage.client_buffer_shards_) {
+            MutexLocker locker(&shard.mutex);
+            total += shard.batches.size();
+        }
+        return total;
+    }
+
+    std::shared_ptr<FileStorage::AllocatedBatch> ClientBufferBatch(
+        FileStorage& fileStorage, uint64_t batch_id) {
+        auto& shard = fileStorage.ShardFor(batch_id);
+        MutexLocker locker(&shard.mutex);
+        auto it = shard.batches.find(batch_id);
+        return it == shard.batches.end() ? nullptr : it->second.batch;
+    }
+
+    bool ExpireClientBufferBatch(FileStorage& fileStorage, uint64_t batch_id) {
+        auto& shard = fileStorage.ShardFor(batch_id);
+        MutexLocker locker(&shard.mutex);
+        auto it = shard.batches.find(batch_id);
+        if (it == shard.batches.end()) return false;
+        it->second.lease_timeout = std::chrono::steady_clock::now();
+        return true;
+    }
+
+    size_t ClientBufferShardIndex(uint64_t batch_id) {
+        return batch_id % FileStorage::kClientBufferShards;
+    }
+
+    FileStorage::BatchGetResult FileStorageShareStagingBuffer(
+        FileStorage& fileStorage,
+        const std::shared_ptr<FileStorage::AllocatedBatch>& staging) {
+        return fileStorage.ShareStagingBuffer(staging, staging->pointers);
+    }
+
     void SetPinnedRestoreArena(FileStorage& fileStorage, void* address,
                                size_t size) {
         fileStorage.pinned_restore_arena_allocator_ =
             ClientBufferAllocator::create(address, size);
+    }
+
+    std::shared_ptr<DelayedReadBackend> InstallDelayedReadBackend(
+        FileStorage& storage, const FileStorageConfig& config) {
+        BucketBackendConfig bucket_config;
+        bucket_config.bucket_keys_limit = 10;
+        auto backend =
+            std::make_shared<DelayedReadBackend>(config, bucket_config);
+        storage.storage_backend_ = backend;
+        return backend;
+    }
+
+    // Keeps the first reader inside the flight until the other readers of the
+    // same batch have joined. A start barrier is not enough: a small object
+    // can finish before those threads are scheduled into BatchGet.
+    static void RequireColdReadWaiters(FileStorage& storage, int waiters) {
+        storage.cold_read_waiters_required_for_test_.store(
+            waiters, std::memory_order_release);
+    }
+
+    static void ClearColdReadWaiters(FileStorage& storage) {
+        storage.cold_read_waiters_required_for_test_.store(
+            0, std::memory_order_release);
     }
 
     tl::expected<void, ErrorCode> FileStorageBatchLoad(
@@ -733,6 +1174,294 @@ class FileStorageTest : public ::testing::Test {
         heartbeat_thread.join();
         drain_thread.join();
         return drain_result;
+    }
+
+    static bool IsDraining(FileStorage& fileStorage) {
+        return fileStorage.draining_.load();
+    }
+
+    static void InjectDiskError(FileStorage& fileStorage, int err,
+                                const char* op) {
+        fileStorage.OnDiskError(err, op);
+    }
+
+    static bool IsDiskFenced(FileStorage& fileStorage) {
+        return fileStorage.disk_fenced_.load();
+    }
+
+    static int CheckFilesystemOf(FileStorage& fileStorage, bool sync_first) {
+        return fileStorage.CheckFilesystem(sync_first);
+    }
+
+    static std::vector<int> DiskRootFds(FileStorage& fileStorage) {
+        std::vector<int> fds;
+        for (const auto& root : fileStorage.disk_roots_) {
+            fds.push_back(root.fd);
+        }
+        return fds;
+    }
+
+    static tl::expected<void, ErrorCode> InitStorageBackend(
+        FileStorage& fileStorage) {
+        return fileStorage.storage_backend_->Init();
+    }
+
+    // Reads values of several sizes back from the offset allocator backend
+    // through FileStorage, whole and in windows, into the staging buffers
+    // FileStorage allocates for them.
+    void RunOffsetBackendLocalReadScenario(bool use_uring) {
+        auto config = FileStorageConfig::FromEnvironment();
+        config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+        config.storage_filepath = data_path;
+        config.total_size_limit = 64 * 1024 * 1024;
+        config.local_buffer_size = 128 * 1024 * 1024;
+        config.use_uring = use_uring;
+        FileStorage fileStorage(config, nullptr, "localhost:9003");
+        ASSERT_TRUE(InitStorageBackend(fileStorage));
+
+        // 200 bytes is about what BatchOffloadUtil writes per key, 56960 is
+        // the KV page size reported in issue #5272 and 131072 the default of
+        // storage_backend_bench. The extents of the small values are not
+        // multiples of 4 KiB, so the records after them do not start on a
+        // page boundary.
+        constexpr size_t kSizes[] = {200,  131072, 1000, 56960,
+                                     1500, 11000,  777};
+        constexpr size_t kKeyCount = 28;
+        std::vector<std::string> keys;
+        std::vector<std::string> values;
+        std::vector<int64_t> sizes;
+        for (size_t i = 0; i < kKeyCount; ++i) {
+            std::string value(kSizes[i % std::size(kSizes)], '\0');
+            for (size_t j = 0; j < value.size(); ++j) {
+                value[j] =
+                    static_cast<char>((j * 31 + (j >> 12) + i * 131) & 0xff);
+            }
+            keys.push_back("fs_offset_key_" + std::to_string(i));
+            sizes.push_back(static_cast<int64_t>(value.size()));
+            values.push_back(std::move(value));
+
+            std::unordered_map<std::string, std::vector<Slice>> batch;
+            batch.emplace(keys.back(),
+                          std::vector<Slice>{Slice{values.back().data(),
+                                                   values.back().size()}});
+            auto stored = fileStorage.storage_backend_->BatchOffload(
+                batch, [](const std::vector<std::string>&,
+                          std::vector<StorageObjectMetadata>&) {
+                    return ErrorCode::OK;
+                });
+            ASSERT_TRUE(stored.has_value()) << stored.error();
+            ASSERT_EQ(stored.value(), 1);
+        }
+
+        // Both results stay alive, so the second batch gets other staging
+        // buffers than the first.
+        std::vector<FileStorage::LocalBatchResult> alive;
+        for (int pass = 0; pass < 2; ++pass) {
+            auto result = fileStorage.BatchGetLocal(keys, sizes);
+            ASSERT_TRUE(result) << result.error();
+            ASSERT_EQ(result->pointers.size(), keys.size());
+            for (size_t i = 0; i < keys.size(); ++i) {
+                EXPECT_EQ(std::memcmp(reinterpret_cast<const char*>(
+                                          result->pointers[i]),
+                                      values[i].data(), values[i].size()),
+                          0)
+                    << "pass " << pass << " key " << keys[i];
+            }
+            alive.push_back(std::move(result.value()));
+        }
+
+        std::vector<int64_t> offsets;
+        std::vector<int64_t> lengths;
+        for (const auto size : sizes) {
+            offsets.push_back(size / 3);
+            lengths.push_back(std::min<int64_t>(size - size / 3, 5000));
+        }
+        auto ranges =
+            fileStorage.BatchGetLocalRanges(keys, offsets, lengths, sizes);
+        ASSERT_TRUE(ranges) << ranges.error();
+        ASSERT_EQ(ranges->pointers.size(), keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            EXPECT_EQ(
+                std::memcmp(reinterpret_cast<const char*>(ranges->pointers[i]),
+                            values[i].data() + offsets[i],
+                            static_cast<size_t>(lengths[i])),
+                0)
+                << "range of key " << keys[i];
+        }
+    }
+
+    struct DiskFenceOutcome {
+        bool fenced = false;
+        int filesystem_checks = 0;
+        int synced_checks = 0;          // checks that ran syncfs first
+        int backend_loads = 0;          // after two reads
+        bool gauge_exported = false;    // before any disk error
+        bool segment_mounted = true;    // after two heartbeats
+        bool offload_released = false;  // queued offload task, after them
+        int64_t fenced_gauge = -1;
+        bool fenced_offload_reached_backend = false;
+        bool fenced_span_load_reached_backend = false;
+        size_t carried_before_fence = 0;  // carry_before_fence only
+        size_t carried_after_fence = 0;   // carried tasks + pooled keys
+    };
+
+    static constexpr int kRealFilesystemCheck = -1;
+
+    // True if a serialized metric text has a sample (not only # HELP/# TYPE)
+    // for the metric.
+    static bool HasSample(const std::string& text, const std::string& name) {
+        return text.rfind(name, 0) == 0 ||
+               text.find("\n" + name) != std::string::npos;
+    }
+
+    // A store with a memory segment and a mounted LOCAL_DISK segment whose
+    // disk reads fail with read_errno while the filesystem check answers
+    // check_errno (kRealFilesystemCheck: the real check on the live test
+    // directory). One put leaves an offload task queued at the master for
+    // this store. Runs two reads, then two heartbeats, and records what
+    // happened. With carry_before_fence, one heartbeat first takes the task
+    // and defers its key to the backend's ungrouped pool (#3006 carry).
+    void RunDiskErrorScenario(const std::string& name, int read_errno,
+                              int check_errno, DiskFenceOutcome& out,
+                              bool carry_before_fence = false) {
+        testing::InProcMaster master;
+        ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                     .set_enable_offload(true)
+                                     .set_default_kv_lease_ttl(0)
+                                     .set_root_fs_dir("")
+                                     .build()));
+        constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+        std::unique_ptr<void, decltype(&std::free)> segment(
+            allocate_buffer_allocator_memory(kSegmentSize), &std::free);
+        ASSERT_NE(segment, nullptr);
+        SimpleAllocator allocator(kSegmentSize);
+        const std::string local_rpc_addr =
+            "127.0.0.1:" + std::to_string(getFreeTcpPort());
+        auto client_result =
+            Client::Create(local_rpc_addr, master.metadata_url(), "tcp",
+                           std::nullopt, master.master_address());
+        ASSERT_TRUE(client_result.has_value());
+        auto client = client_result.value();
+        ASSERT_TRUE(client->MountSegment(segment.get(), kSegmentSize, "tcp"));
+        ASSERT_TRUE(client->RegisterLocalMemory(
+            allocator.getBase(), kSegmentSize, "cpu:0", false, false));
+        ASSERT_TRUE(client->MountLocalDiskSegment(true).has_value());
+
+        // The put queues an offload task for this store that holds a
+        // reference on the memory replica. Once the store is no longer
+        // registered, Upsert is refused until the master releases the task
+        // (while the task is still queued, Upsert would cancel it itself).
+        const std::string offload_key = "offload_key";
+        const std::string value(64, 'v');
+        void* buffer = allocator.allocate(value.size());
+        ASSERT_NE(buffer, nullptr);
+        std::memcpy(buffer, value.data(), value.size());
+        std::vector<Slice> slices{{buffer, value.size()}};
+        ReplicateConfig replicate;
+        replicate.replica_num = 1;
+        ASSERT_TRUE(client->Put(offload_key, slices, replicate));
+
+        FileStorageConfig config = FileStorageConfig::FromEnvironment();
+        config.storage_filepath = data_path + "/" + name;
+        config.local_buffer_size = 4 * 1024 * 1024;
+        fs::create_directories(config.storage_filepath);
+        SsdMetric metric;
+        FileStorage file_storage(config, client, local_rpc_addr, &metric);
+        std::string metrics_text;
+        metric.serialize(metrics_text);
+        out.gauge_exported =
+            HasSample(metrics_text, "mooncake_ssd_disk_fenced");
+        BucketBackendConfig bucket_config;
+        bucket_config.bucket_keys_limit = carry_before_fence ? 2 : 1;
+        auto backend = std::make_shared<FailingReadBackend>(
+            config, bucket_config, read_errno);
+        file_storage.storage_backend_ = backend;
+        backend->SetDiskErrorObserver([&file_storage](int err, const char* op) {
+            file_storage.OnDiskError(err, op);
+        });
+        ASSERT_TRUE(backend->Init());
+        if (check_errno != kRealFilesystemCheck) {
+            file_storage.test_filesystem_check_ = [&out,
+                                                   check_errno](bool sync) {
+                ++out.filesystem_checks;
+                out.synced_checks += sync ? 1 : 0;
+                return check_errno;
+            };
+        }
+        {
+            MutexLocker locker(&file_storage.offloading_mutex_);
+            file_storage.enable_offloading_ = true;
+        }
+        if (carry_before_fence) {
+            (void)file_storage.Heartbeat();
+            out.carried_before_fence =
+                file_storage.deferred_task_by_storage_key_.size();
+        }
+
+        for (int i = 0; i < 2; ++i) {
+            std::string read_buffer(64, '\0');
+            std::unordered_map<std::string, Slice> batch{
+                {"key", Slice{read_buffer.data(), read_buffer.size()}}};
+            EXPECT_FALSE(file_storage.BatchLoad(batch).has_value());
+        }
+        for (int i = 0; i < 2; ++i) {
+            (void)file_storage.Heartbeat();
+        }
+
+        out.fenced = file_storage.disk_fenced_.load();
+        out.backend_loads = backend->loads;
+        out.carried_after_fence =
+            file_storage.deferred_task_by_storage_key_.size() +
+            backend->UngroupedOffloadingObjectsSize();
+        std::vector<OffloadTaskItem> items;
+        out.segment_mounted =
+            client->OffloadObjectHeartbeat(true, items).has_value();
+        out.offload_released =
+            client->Upsert(offload_key, slices, replicate).has_value();
+        out.fenced_gauge = metric.ssd_disk_fenced.value();
+        if (out.fenced && !carry_before_fence) {
+            // Offload work already in hand must not reach a fenced disk. The
+            // key has a memory replica on this store, so without the fence
+            // this offload would reach the backend.
+            auto offload = file_storage.OffloadObjects(
+                {OffloadTaskItem{.tenant_id = TenantId::Default().value(),
+                                 .key = offload_key,
+                                 .size = static_cast<int64_t>(value.size())}});
+            EXPECT_FALSE(offload.has_value());
+            out.fenced_offload_reached_backend = backend->offloads > 0;
+            // Neither may a byte-window read.
+            std::string span_buffer(64, '\0');
+            std::unordered_map<std::string, StorageValueSpan> spans{
+                {"key", StorageValueSpan{
+                            0, span_buffer.size(),
+                            Slice{span_buffer.data(), span_buffer.size()}}}};
+            EXPECT_FALSE(file_storage.BatchLoadSpans(spans).has_value());
+            out.fenced_span_load_reached_backend = backend->span_loads > 0;
+        }
+        allocator.deallocate(buffer, value.size());
+        EXPECT_TRUE(client->UnmountSegment(segment.get(), kSegmentSize));
+        EXPECT_TRUE(client->unregisterLocalMemory(allocator.getBase()));
+    }
+
+    // An EIO from second_op arrives while the check for an EIO from first_op
+    // is running (simulated by re-entering from inside the check). Check i
+    // answers check_errnos[i], or 0 past the end; synced records whether
+    // each check ran syncfs. Returns whether the disk tier is fenced.
+    static bool FailDuringFilesystemCheck(FileStorage& fileStorage,
+                                          const char* first_op,
+                                          const char* second_op,
+                                          std::vector<int> check_errnos,
+                                          std::vector<bool>& synced) {
+        fileStorage.test_filesystem_check_ =
+            [&fileStorage, second_op, check_errnos, &synced](bool sync) {
+                synced.push_back(sync);
+                if (synced.size() == 1) fileStorage.OnDiskError(EIO, second_op);
+                return synced.size() <= check_errnos.size()
+                           ? check_errnos[synced.size() - 1]
+                           : 0;
+            };
+        fileStorage.OnDiskError(EIO, first_op);
+        return fileStorage.disk_fenced_.load();
     }
 
     void AssertHeartbeatEvictsAllKeys(
@@ -1124,6 +1853,47 @@ TEST_F(FileStorageTest, IsEnableOffloading) {
                 !enable_offloading_result3.value());
 }
 
+#ifdef USE_URING
+// Pages this process has pinned, in KiB (VmPin).
+static long PinnedKib() {
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.rfind("VmPin:", 0) == 0) return std::stol(line.substr(6));
+    }
+    return -1;
+}
+
+// With io_uring, FileStorage pins its staging buffer as the fixed buffer. The
+// destructor must unpin it before the buffer is freed.
+TEST_F(FileStorageTest, UringStagingBufferUnpinnedOnDestruction) {
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 128 * 1024 * 1024;
+    file_storage_config.use_uring = true;
+    const long pinned_before = PinnedKib();
+    long pinned_alive = -1;
+    {
+        FileStorage file_storage(file_storage_config, nullptr,
+                                 "localhost:9003");
+        pinned_alive = PinnedKib();
+    }
+    if (pinned_alive <= pinned_before) {
+        GTEST_SKIP() << "io_uring did not pin the staging buffer here "
+                        "(no buffer clone support or RLIMIT_MEMLOCK too small)";
+    }
+    EXPECT_LE(PinnedKib(), pinned_before);
+}
+
+TEST_F(FileStorageTest, OffsetBackendLocalReadsWithUring) {
+    RunOffsetBackendLocalReadScenario(/*use_uring=*/true);
+}
+#endif
+
+TEST_F(FileStorageTest, OffsetBackendLocalReads) {
+    RunOffsetBackendLocalReadScenario(/*use_uring=*/false);
+}
+
 TEST_F(FileStorageTest, DistributedBackendSelectsControlPlaneFromStorageMode) {
     SetEnv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
            "distributed_storage_backend");
@@ -1289,6 +2059,29 @@ TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_deduplicates_carryover) {
     EXPECT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 0);
 }
 
+TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_flushes_replayed_tail) {
+    std::unordered_map<std::string, int64_t> offloading_objects;
+    offloading_objects.emplace("tail-0", 1);
+    offloading_objects.emplace("tail-1", 1);
+
+    std::vector<std::vector<std::string>> buckets_keys;
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "10");
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, offloading_objects, buckets_keys));
+    ASSERT_TRUE(buckets_keys.empty());
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 2);
+
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, offloading_objects, buckets_keys));
+    ASSERT_EQ(buckets_keys.size(), 1);
+    EXPECT_EQ(buckets_keys.front().size(), 2);
+    EXPECT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 0);
+}
+
 TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_size_limit) {
     std::unordered_map<std::string, int64_t> offloading_objects;
     for (size_t i = 0; i < 35; i++) {
@@ -1366,6 +2159,10 @@ TEST_F(FileStorageTest,
     }
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
+}
+
+TEST_F(FileStorageTest, EmptyHeartbeatFlushesDeferredTail) {
+    RunDeferredHeartbeatTailScenario();
 }
 
 TEST_F(FileStorageTest, OffloadObjects_capacity_limit_releases_deferred_tasks) {
@@ -2064,5 +2861,770 @@ TEST_F(FileStorageTest,
        AffinityOnlyBatchPutAfterPhysicalWipeHealsDanglingLocalDiskReplica) {
     RunBatchPutHealWipeScenario(data_path, false, true);
 }
+
+TEST_F(FileStorageTest, ClassifyDiskErrno) {
+    using Action = FileStorage::DiskErrorAction;
+    for (int err : {ENODEV, ENXIO, EROFS, ESHUTDOWN}) {
+        EXPECT_EQ(FileStorage::ClassifyDiskErrno(err), Action::kFence) << err;
+    }
+    for (int err : {EIO, EUCLEAN, EBADMSG, ENODATA, EREMOTEIO, EILSEQ,
+                    ETIMEDOUT, ENOLINK}) {
+        EXPECT_EQ(FileStorage::ClassifyDiskErrno(err), Action::kCheckFilesystem)
+            << err;
+    }
+    // 0 is a logical failure (short read/write) with no syscall error.
+    for (int err : {0, ENOSPC, EDQUOT, EFBIG, ENOENT, EEXIST, EACCES, EMFILE,
+                    ENFILE, ENOMEM, EBADF, EISDIR, EINTR}) {
+        EXPECT_EQ(FileStorage::ClassifyDiskErrno(err), Action::kIgnore) << err;
+    }
+}
+
+// EIO on a filesystem that is shut down: the first failure fences the disk
+// tier. Reads stop reaching the disk at once, offload stops, the heartbeat
+// hands the queued offload task back to the master (releasing the memory
+// replica it pinned), unmounts the segment and never re-mounts it.
+TEST_F(FileStorageTest, DiskFenceEioOnDeadFilesystemFencesDiskTier) {
+    DiskFenceOutcome out;
+    RunDiskErrorScenario("fence_eio_dead", EIO, EIO, out);
+    EXPECT_TRUE(out.fenced);
+    EXPECT_EQ(out.filesystem_checks, 1);
+    EXPECT_EQ(out.synced_checks, 0);  // a read failure checks without syncfs
+    EXPECT_EQ(out.backend_loads, 1);
+    EXPECT_FALSE(out.segment_mounted);
+    EXPECT_TRUE(out.offload_released);
+    EXPECT_EQ(out.fenced_gauge, 1);
+    EXPECT_FALSE(out.fenced_offload_reached_backend);
+    EXPECT_FALSE(out.fenced_span_load_reached_backend);
+}
+
+// EIO while the filesystem is alive (real fstat on the live directory): one
+// bad file, not a dead disk. Nothing is fenced.
+TEST_F(FileStorageTest, DiskFenceEioOnLiveFilesystemDoesNotFence) {
+    DiskFenceOutcome out;
+    RunDiskErrorScenario("fence_eio_live", EIO, kRealFilesystemCheck, out);
+    EXPECT_FALSE(out.fenced);
+    EXPECT_EQ(out.backend_loads, 2);
+    EXPECT_TRUE(out.segment_mounted);
+    EXPECT_TRUE(out.gauge_exported);
+    EXPECT_EQ(out.fenced_gauge, 0);
+}
+
+// ENOSPC never fences and never consults the filesystem check, even when
+// that check would fail: eviction can free space.
+TEST_F(FileStorageTest, DiskFenceEnospcIsIgnored) {
+    DiskFenceOutcome out;
+    RunDiskErrorScenario("fence_enospc", ENOSPC, EIO, out);
+    EXPECT_FALSE(out.fenced);
+    EXPECT_EQ(out.filesystem_checks, 0);
+    EXPECT_EQ(out.backend_loads, 2);
+    EXPECT_TRUE(out.segment_mounted);
+}
+
+// ENODEV fences without a filesystem check, even when that check passes.
+TEST_F(FileStorageTest, DiskFenceEnodevFencesWithoutFilesystemCheck) {
+    DiskFenceOutcome out;
+    RunDiskErrorScenario("fence_enodev", ENODEV, 0, out);
+    EXPECT_TRUE(out.fenced);
+    EXPECT_EQ(out.filesystem_checks, 0);
+    EXPECT_EQ(out.backend_loads, 1);
+    EXPECT_FALSE(out.segment_mounted);
+    EXPECT_TRUE(out.offload_released);
+}
+
+// With several disks in storage_filepath, the filesystem check opens and
+// checks every root, instead of stat-ing the whole list as one path (ENOENT,
+// which would let a dead disk go unfenced).
+TEST_F(FileStorageTest, DiskFenceChecksEveryOffloadRoot) {
+    const auto root_a = fs::path(data_path) / "fence_root_a";
+    const auto root_b = fs::path(data_path) / "fence_root_b";
+    fs::create_directories(root_a);
+    fs::create_directories(root_b);
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = root_a.string() + "," + root_b.string();
+    FileStorage file_storage(config, nullptr, "localhost:9004");
+    const std::vector<int> fds = DiskRootFds(file_storage);
+    ASSERT_EQ(fds.size(), 2u);
+    EXPECT_GE(fds[0], 0);
+    EXPECT_GE(fds[1], 0);
+    EXPECT_EQ(CheckFilesystemOf(file_storage, /*sync_first=*/false), 0);
+    EXPECT_EQ(CheckFilesystemOf(file_storage, /*sync_first=*/true), 0);
+}
+
+// A task carried across a bucket deferral (#3006) is NACKed by the fence:
+// nothing re-emits the pool afterwards, and the task would pin its source
+// replica until the master's TTL reaper.
+TEST_F(FileStorageTest, DiskFenceNacksCarriedOffloadTasks) {
+    DiskFenceOutcome out;
+    RunDiskErrorScenario("fence_carry", EIO, EIO, out,
+                         /*carry_before_fence=*/true);
+    EXPECT_EQ(out.carried_before_fence, 1u);
+    EXPECT_TRUE(out.fenced);
+    EXPECT_FALSE(out.segment_mounted);
+    EXPECT_EQ(out.carried_after_fence, 0u);
+    EXPECT_TRUE(out.offload_released);
+}
+
+// Concurrent failures do not run parallel filesystem checks: one that finds
+// a check running is queued behind it. Once the running check fences, the
+// queued failure needs no check. A write failure's check runs syncfs first.
+TEST_F(FileStorageTest, DiskFenceRunsOneCheckAtATime) {
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    FileStorage file_storage(config, nullptr, "localhost:9003");
+    std::vector<bool> synced;
+    EXPECT_TRUE(FailDuringFilesystemCheck(file_storage, "pwritev", "preadv",
+                                          {EIO}, synced));
+    EXPECT_EQ(synced, std::vector<bool>{true});
+}
+
+// A write failure that arrives during a read failure's fstat-only check is
+// checked after it, with syncfs: XFS is usually still up until syncfs forces
+// the log write, so only the write's check can find the dead device.
+TEST_F(FileStorageTest, DiskFenceChecksWriteFailureQueuedBehindReadCheck) {
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    FileStorage file_storage(config, nullptr, "localhost:9003");
+    std::vector<bool> synced;
+    EXPECT_TRUE(FailDuringFilesystemCheck(file_storage, "preadv", "pwritev",
+                                          {0, EIO}, synced));
+    EXPECT_EQ(synced, (std::vector<bool>{false, true}));
+}
+
+// When the queued check passes too, the checking slot is released: a later
+// failure runs its own check.
+TEST_F(FileStorageTest, DiskFenceQueuedCheckReleasesTheCheckingSlot) {
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    FileStorage file_storage(config, nullptr, "localhost:9003");
+    std::vector<bool> synced;
+    EXPECT_FALSE(FailDuringFilesystemCheck(file_storage, "preadv", "pwritev",
+                                           {0, 0}, synced));
+    EXPECT_EQ(synced, (std::vector<bool>{false, true}));
+    InjectDiskError(file_storage, EIO, "read");
+    EXPECT_EQ(synced, (std::vector<bool>{false, true, false}));
+    EXPECT_FALSE(IsDiskFenced(file_storage));
+}
+
+// A drain whose unmount RPC fails keeps its latch: the heartbeat must
+// not re-mount, and once the master answers again the heartbeat retries the
+// unmount. The master is restarted and the segment re-mounted behind the
+// store's back, standing in for a master that kept the registration after
+// the store's RPC failed (e.g. timed out during the master's sweep).
+TEST_F(FileStorageTest, DrainUnmountFailureKeepsLatchAndRetries) {
+    auto master_root = fs::path(data_path) / "drain_retry_master";
+    fs::create_directories(master_root);
+    auto master_config = [&](int rpc, int metadata, int metrics) {
+        auto builder = InProcMasterConfigBuilder()
+                           .set_enable_offload(true)
+                           .set_root_fs_dir(master_root.string());
+        if (rpc > 0) {
+            builder.set_rpc_port(rpc)
+                .set_http_metadata_port(metadata)
+                .set_http_metrics_port(metrics);
+        }
+        return builder.build();
+    };
+    testing::InProcMaster master;
+    ASSERT_TRUE(master.Start(master_config(0, 0, 0)));
+    const int rpc_port = master.rpc_port();
+    const int metadata_port = master.http_metadata_port();
+    const int metrics_port = master.http_metrics_port();
+
+    const std::string local_rpc_addr =
+        "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto client = Client::Create(local_rpc_addr, master.metadata_url(), "tcp",
+                                 std::nullopt, master.master_address());
+    ASSERT_TRUE(client.has_value());
+    ASSERT_TRUE(client.value()->MountLocalDiskSegment(true).has_value());
+
+    FileStorageConfig config = FileStorageConfig::FromEnvironment();
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    config.storage_filepath = data_path + "/drain_retry";
+    config.local_buffer_size = 4 * 1024 * 1024;
+    fs::create_directories(config.storage_filepath);
+    FileStorage file_storage(config, client.value(), local_rpc_addr);
+    // A heartbeat that is not skipped runs a full pass, which needs an
+    // initialized backend (Init() does this in production).
+    ASSERT_TRUE(InitStorageBackend(file_storage).has_value());
+
+    master.Stop();
+    ASSERT_FALSE(file_storage.DrainLocalDiskSegment(0).has_value());
+    EXPECT_TRUE(IsDraining(file_storage));
+    (void)FileStorageHeartbeat(file_storage);  // master down: no-op
+    EXPECT_TRUE(IsDraining(file_storage));
+
+    ASSERT_TRUE(
+        master.Start(master_config(rpc_port, metadata_port, metrics_port)));
+    bool remounted = false;
+    for (int i = 0; i < 100 && !remounted; ++i) {
+        remounted = client.value()->MountLocalDiskSegment(true).has_value();
+        if (!remounted) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+    }
+    ASSERT_TRUE(remounted) << "client did not reach the restarted master";
+
+    for (int i = 0; i < 2; ++i) {
+        (void)FileStorageHeartbeat(file_storage);
+    }
+    EXPECT_TRUE(IsDraining(file_storage));
+    std::vector<OffloadTaskItem> offload_items;
+    auto heartbeat_rpc =
+        client.value()->OffloadObjectHeartbeat(true, offload_items);
+    ASSERT_FALSE(heartbeat_rpc.has_value());
+    EXPECT_EQ(ErrorCode::SEGMENT_NOT_FOUND, heartbeat_rpc.error());
+}
+
+TEST_F(FileStorageTest, BatchGetRanges_RegistersReleasableStaging) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 128 * 1024 * 1024;
+    config.total_keys_limit = 1000;
+    FileStorage storage(config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(storage, keys, sizes, batch_data));
+    ASSERT_FALSE(keys.empty());
+    ASSERT_GT(sizes.front(), 2);
+
+    const int64_t offset = 1;
+    const int64_t length = sizes.front() - 2;
+    auto result = storage.BatchGetRanges({keys.front()}, {offset}, {length},
+                                         {sizes.front()});
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->pointers.size(), 1u);
+    EXPECT_EQ(
+        std::string(reinterpret_cast<const char*>(result->pointers[0]), length),
+        batch_data.at(keys.front()).substr(offset, length));
+    EXPECT_EQ(ClientBufferBatchCount(storage), 1u);
+    EXPECT_NE(ClientBufferBatch(storage, result->batch_id), nullptr);
+    EXPECT_TRUE(ExpireClientBufferBatch(storage, result->batch_id));
+    EXPECT_TRUE(storage.ReleaseBuffer(result->batch_id));
+    EXPECT_EQ(ClientBufferBatchCount(storage), 0u);
+}
+
+TEST_F(FileStorageTest, BatchGetSingleflight_SerializesSameKey) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 128 * 1024 * 1024;
+    file_storage_config.total_keys_limit = 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+    ASSERT_FALSE(keys.empty());
+
+    const std::string target_key = keys.front();
+    const int64_t target_size = sizes.front();
+    constexpr int kConcurrency = 8;
+
+    std::atomic<int> success_count{0};
+    std::atomic<int> started{0};
+    std::vector<std::thread> threads;
+    threads.reserve(kConcurrency);
+
+    for (int i = 0; i < kConcurrency; ++i) {
+        threads.emplace_back([&] {
+            started.fetch_add(1);
+            while (started.load() < kConcurrency) {
+                std::this_thread::yield();
+            }
+            auto result = fileStorage.BatchGet({target_key}, {target_size});
+            if (result) {
+                fileStorage.ReleaseBuffer(result->batch_id);
+                success_count.fetch_add(1);
+            }
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    EXPECT_EQ(success_count.load(), kConcurrency)
+        << "All concurrent BatchGet calls should succeed";
+}
+
+TEST_F(FileStorageTest, BatchGetSingleflight_DifferentKeysRunConcurrently) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 128 * 1024 * 1024;
+    file_storage_config.total_keys_limit = 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+    ASSERT_GE(keys.size(), 2u) << "Need at least 2 keys for this test";
+
+    std::atomic<int> success_count{0};
+    std::vector<std::thread> threads;
+
+    for (size_t i = 0; i < std::min(keys.size(), size_t(4)); ++i) {
+        threads.emplace_back([&, i] {
+            auto result = fileStorage.BatchGet({keys[i]}, {sizes[i]});
+            if (result) {
+                fileStorage.ReleaseBuffer(result->batch_id);
+                success_count.fetch_add(1);
+            }
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    EXPECT_EQ(success_count.load(),
+              static_cast<int>(std::min(keys.size(), size_t(4))))
+        << "All different-key BatchGet calls should succeed";
+}
+
+TEST_F(FileStorageTest, BatchGetSingleflight_MultiKeyBatchSucceeds) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 128 * 1024 * 1024;
+    file_storage_config.total_keys_limit = 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+    ASSERT_GE(keys.size(), 2u);
+
+    auto result = fileStorage.BatchGet(keys, sizes);
+    ASSERT_TRUE(result) << "Multi-key BatchGet should succeed";
+    fileStorage.ReleaseBuffer(result->batch_id);
+}
+
+TEST_F(FileStorageTest, BatchGetLocalSharesOwnerAndPreservesPointerOrder) {
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 8 * 1024 * 1024;
+    config.use_uring = false;
+    FileStorage storage(config, nullptr, "localhost:9003");
+    auto backend = InstallDelayedReadBackend(storage, config);
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> data;
+    ASSERT_TRUE(FileStorageBatchOffload(storage, keys, sizes, data));
+    ASSERT_GE(keys.size(), 3u);
+    keys.resize(3);
+    sizes.resize(3);
+
+    constexpr size_t kReaders = 8;
+    RequireColdReadWaiters(storage, static_cast<int>(kReaders - 1));
+    std::barrier start(static_cast<std::ptrdiff_t>(kReaders));
+    std::vector<std::optional<FileStorage::LocalBatchResult>> results(kReaders);
+    std::vector<std::thread> readers;
+    for (size_t i = 0; i < kReaders; ++i) {
+        readers.emplace_back([&, i] {
+            auto requested_keys = keys;
+            auto requested_sizes = sizes;
+            if (i % 2) {
+                std::reverse(requested_keys.begin(), requested_keys.end());
+                std::reverse(requested_sizes.begin(), requested_sizes.end());
+            }
+            start.arrive_and_wait();
+            auto result =
+                storage.BatchGetLocal(requested_keys, requested_sizes);
+            if (result) results[i] = std::move(*result);
+        });
+    }
+    for (auto& reader : readers) reader.join();
+
+    // The follow-up read is a single reader. Clear the rendezvous first so
+    // its leader does not wait for waiters that will never arrive.
+    ClearColdReadWaiters(storage);
+    EXPECT_EQ(backend->loads.load(), 1u);
+    ASSERT_TRUE(results[0]);
+    for (size_t reader = 0; reader < kReaders; ++reader) {
+        ASSERT_TRUE(results[reader]);
+        ASSERT_EQ(results[reader]->pointers.size(), keys.size());
+        for (size_t index = 0; index < keys.size(); ++index) {
+            const size_t key_index =
+                reader % 2 ? keys.size() - index - 1 : index;
+            const auto pointer = results[reader]->pointers[index];
+            EXPECT_EQ(pointer, results[0]->pointers[key_index]);
+            EXPECT_EQ(std::string(reinterpret_cast<const char*>(pointer),
+                                  sizes[key_index]),
+                      data.at(keys[key_index]));
+        }
+    }
+    // Retaining consumers keeps their bytes alive, but does not cache reads.
+    auto later = storage.BatchGetLocal(keys, sizes);
+    ASSERT_TRUE(later);
+    EXPECT_EQ(backend->loads.load(), 2u);
+    EXPECT_NE(later->pointers.front(), results[0]->pointers.front());
+}
+
+TEST_F(FileStorageTest, LocalAndRpcReadsKeepSeparateStagingContracts) {
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 8 * 1024 * 1024;
+    config.use_uring = false;
+    std::vector<char> arena(64 * 1024 + 4096);
+    const auto arena_begin =
+        (reinterpret_cast<uintptr_t>(arena.data()) + 4095) & ~4095ULL;
+    FileStorage storage(config, nullptr, "localhost:9003");
+    auto backend = InstallDelayedReadBackend(storage, config);
+    SetPinnedRestoreArena(storage, reinterpret_cast<void*>(arena_begin),
+                          64 * 1024);
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> data;
+    ASSERT_TRUE(FileStorageBatchOffload(storage, keys, sizes, data));
+    ASSERT_GE(keys.size(), 3u);
+    keys.resize(3);
+    sizes.resize(3);
+    std::optional<FileStorage::LocalBatchResult> local;
+    std::optional<FileStorage::BatchGetResult> rpc;
+    std::barrier start(2);
+    std::thread local_reader([&] {
+        start.arrive_and_wait();
+        auto result = storage.BatchGetLocal(keys, sizes);
+        if (result) local = std::move(*result);
+    });
+    std::thread rpc_reader([&] {
+        start.arrive_and_wait();
+        auto result = storage.BatchGet(keys, sizes);
+        if (result) rpc = std::move(*result);
+    });
+    local_reader.join();
+    rpc_reader.join();
+    ASSERT_TRUE(local);
+    ASSERT_TRUE(rpc);
+    EXPECT_EQ(backend->loads.load(), 2u);
+    ASSERT_EQ(local->pointers.size(), keys.size());
+    ASSERT_EQ(rpc->pointers.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        EXPECT_GE(local->pointers[i], arena_begin);
+        EXPECT_LT(local->pointers[i], arena_begin + 64 * 1024);
+        EXPECT_TRUE(rpc->pointers[i] < arena_begin ||
+                    rpc->pointers[i] >= arena_begin + 64 * 1024);
+        for (const auto pointer : {local->pointers[i], rpc->pointers[i]}) {
+            EXPECT_EQ(
+                std::string(reinterpret_cast<const char*>(pointer), sizes[i]),
+                data.at(keys[i]));
+        }
+    }
+    EXPECT_TRUE(storage.ReleaseBuffer(rpc->batch_id));
+}
+
+TEST_F(FileStorageTest, BatchGetSingleflight_SameMultiKeyBatchShared) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 128 * 1024 * 1024;
+    file_storage_config.total_keys_limit = 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+    ASSERT_GE(keys.size(), 3u);
+
+    keys.resize(3);
+    sizes.resize(3);
+    constexpr int kConcurrency = 16;
+    RequireColdReadWaiters(fileStorage, kConcurrency - 1);
+    std::atomic<int> started{0};
+    std::atomic<int> success_count{0};
+    std::vector<uint64_t> first_key_pointers(kConcurrency, 0);
+    std::vector<std::thread> threads;
+    threads.reserve(kConcurrency);
+
+    for (int reader = 0; reader < kConcurrency; ++reader) {
+        threads.emplace_back([&, reader] {
+            std::vector<std::string> reader_keys;
+            std::vector<int64_t> reader_sizes;
+            for (size_t offset = 0; offset < keys.size(); ++offset) {
+                const size_t index = (reader + offset) % keys.size();
+                reader_keys.push_back(keys[index]);
+                reader_sizes.push_back(sizes[index]);
+            }
+
+            started.fetch_add(1);
+            while (started.load() < kConcurrency) {
+                std::this_thread::yield();
+            }
+            auto result = fileStorage.BatchGet(reader_keys, reader_sizes);
+            if (!result) return;
+            ASSERT_EQ(result->pointers.size(), reader_keys.size());
+            for (size_t i = 0; i < reader_keys.size(); ++i) {
+                const auto* data =
+                    reinterpret_cast<const char*>(result->pointers[i]);
+                EXPECT_EQ(std::string(data, reader_sizes[i]),
+                          batch_data.at(reader_keys[i]));
+                if (reader_keys[i] == keys.front()) {
+                    first_key_pointers[reader] = result->pointers[i];
+                }
+            }
+            fileStorage.ReleaseBuffer(result->batch_id);
+            success_count.fetch_add(1);
+        });
+    }
+
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    ASSERT_EQ(success_count.load(), kConcurrency);
+    size_t largest_shared_group = 0;
+    for (int i = 0; i < kConcurrency; ++i) {
+        size_t shared_group = 0;
+        for (int j = 0; j < kConcurrency; ++j) {
+            if (first_key_pointers[j] == first_key_pointers[i]) {
+                ++shared_group;
+            }
+        }
+        largest_shared_group = std::max(largest_shared_group, shared_group);
+    }
+    EXPECT_GT(largest_shared_group, 1u)
+        << "At least 2 reordered readers should share one staging batch";
+}
+
+TEST_F(FileStorageTest, BatchGetSingleflight_StagingSharingVerification) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 128 * 1024 * 1024;
+    file_storage_config.total_keys_limit = 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+    ASSERT_FALSE(keys.empty());
+
+    const std::string target_key = keys.front();
+    const int64_t target_size = sizes.front();
+    const std::string& expected_data = batch_data.at(target_key);
+    constexpr int kConcurrency = 16;
+    RequireColdReadWaiters(fileStorage, kConcurrency - 1);
+
+    std::atomic<int> success_count{0};
+    std::atomic<int> started{0};
+    std::vector<uint64_t> batch_ids(kConcurrency, 0);
+    std::vector<uint64_t> staging_ptrs(kConcurrency, 0);
+    std::vector<std::thread> threads;
+    threads.reserve(kConcurrency);
+
+    for (int i = 0; i < kConcurrency; ++i) {
+        threads.emplace_back([&, i] {
+            started.fetch_add(1);
+            while (started.load() < kConcurrency) {
+                std::this_thread::yield();
+            }
+            auto result = fileStorage.BatchGet({target_key}, {target_size});
+            if (!result) return;
+            ASSERT_EQ(result->pointers.size(), 1u);
+            batch_ids[i] = result->batch_id;
+            staging_ptrs[i] = result->pointers[0];
+
+            // Verify data correctness: read from staging pointer. The reader
+            // still holds its own batch id here, so the staging buffer cannot
+            // be recycled underneath it even if the other readers are done.
+            auto* data_ptr = reinterpret_cast<const char*>(result->pointers[0]);
+            std::string actual(data_ptr, target_size);
+            EXPECT_EQ(actual, expected_data)
+                << "Data mismatch for batch_id=" << result->batch_id;
+
+            fileStorage.ReleaseBuffer(result->batch_id);
+            success_count.fetch_add(1);
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    EXPECT_EQ(success_count.load(), kConcurrency)
+        << "All concurrent BatchGet calls should succeed";
+
+    // Staging sharing now shows up as several batch ids backed by one staging
+    // buffer: every reader releases its own id, and the memory returns to the
+    // pool when the last id goes away.
+    std::unordered_set<uint64_t> distinct_ids(batch_ids.begin(),
+                                              batch_ids.end());
+    EXPECT_EQ(distinct_ids.size(), static_cast<size_t>(kConcurrency))
+        << "Every reader should get its own batch id";
+
+    size_t largest_group = 0;
+    for (int i = 0; i < kConcurrency; ++i) {
+        size_t group = 0;
+        for (int j = 0; j < kConcurrency; ++j) {
+            if (staging_ptrs[j] == staging_ptrs[i]) group++;
+        }
+        largest_group = std::max(largest_group, group);
+    }
+    LOG(INFO) << "Staging sharing results: " << kConcurrency << " readers used "
+              << distinct_ids.size() << " batch ids, " << largest_group
+              << " of them shared one staging buffer";
+    EXPECT_GT(largest_group, 1u)
+        << "At least 2 readers should share the same staging buffer";
+}
+
+TEST_F(FileStorageTest, BatchGetSingleflight_LastReleaseFreesSharedStaging) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    constexpr int64_t kBufferSize = 1024 * 1024;
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    config.local_buffer_size = kBufferSize;
+    config.total_keys_limit = 1000;
+    config.use_uring = false;
+    FileStorage storage(config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(storage, keys, sizes, batch_data));
+    ASSERT_FALSE(keys.empty());
+
+    const auto& key = keys.front();
+    const auto size = sizes.front();
+    auto first = storage.BatchGet({key}, {size});
+    ASSERT_TRUE(first);
+    ASSERT_EQ(first->pointers.size(), 1u);
+    auto staging = ClientBufferBatch(storage, first->batch_id);
+    ASSERT_NE(staging, nullptr);
+
+    // Register a second lease on the same staging buffer, then let the
+    // registered batch IDs own the buffer for the rest of the test.
+    auto last = FileStorageShareStagingBuffer(storage, staging);
+    staging.reset();
+    ASSERT_NE(first->batch_id, last.batch_id);
+    ASSERT_EQ(first->pointers, last.pointers);
+    ASSERT_EQ(ClientBufferBatchCount(storage), 2u);
+
+    ASSERT_TRUE(storage.ReleaseBuffer(first->batch_id));
+    EXPECT_EQ(ClientBufferBatchCount(storage), 1u);
+
+    const std::vector<std::string> probe_keys = {key};
+    const std::vector<int64_t> probe_sizes = {kBufferSize};
+    auto probe = FileStorageAllocateBatch(storage, probe_keys, probe_sizes);
+    ASSERT_FALSE(probe);
+    EXPECT_EQ(probe.error(), ErrorCode::BUFFER_OVERFLOW);
+    const auto* data = reinterpret_cast<const char*>(last.pointers.front());
+    EXPECT_EQ(std::string(data, size), batch_data.at(key));
+
+    ASSERT_TRUE(storage.ReleaseBuffer(last.batch_id));
+    EXPECT_FALSE(storage.ReleaseBuffer(last.batch_id));
+    EXPECT_EQ(ClientBufferBatchCount(storage), 0u);
+    EXPECT_TRUE(FileStorageAllocateBatch(storage, probe_keys, probe_sizes))
+        << "The last release should return staging memory to the pool";
+}
+
+TEST_F(FileStorageTest, BatchGetSingleflight_AliasLeasesAreIndependent) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    constexpr int64_t kBufferSize = 1024 * 1024;
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = kBufferSize;
+    file_storage_config.total_keys_limit = 1000;
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
+    ASSERT_FALSE(keys.empty());
+
+    auto leader = fileStorage.BatchGet({keys.front()}, {sizes.front()});
+    ASSERT_TRUE(leader);
+    auto staging = ClientBufferBatch(fileStorage, leader->batch_id);
+    ASSERT_NE(staging, nullptr);
+
+    auto alias = FileStorageShareStagingBuffer(fileStorage, staging);
+    ASSERT_NE(ClientBufferShardIndex(leader->batch_id),
+              ClientBufferShardIndex(alias.batch_id));
+    ASSERT_EQ(ClientBufferBatchCount(fileStorage), 2u);
+    staging.reset();
+
+    // Expiring the leader must not expire an alias in another shard. The
+    // alias started its own lease window when it joined the shared staging
+    // buffer, and its shard mutex cannot protect a deadline stored on the
+    // shared AllocatedBatch.
+    ASSERT_TRUE(ExpireClientBufferBatch(fileStorage, leader->batch_id));
+    const std::vector<std::string> probe_key = {keys.front()};
+    const std::vector<int64_t> probe_size = {kBufferSize};
+    auto probe = FileStorageAllocateBatch(fileStorage, probe_key, probe_size);
+    ASSERT_FALSE(probe);
+    EXPECT_EQ(probe.error(), ErrorCode::BUFFER_OVERFLOW);
+
+    EXPECT_FALSE(fileStorage.ReleaseBuffer(leader->batch_id))
+        << "The expired leader entry should have been collected";
+    EXPECT_TRUE(fileStorage.ReleaseBuffer(alias.batch_id))
+        << "The alias has an independent, unexpired lease";
+    EXPECT_EQ(ClientBufferBatchCount(fileStorage), 0u);
+}
+
+TEST_F(FileStorageTest,
+       BatchGetSingleflight_AbandonedReaderDoesNotLeakStaging) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    constexpr int64_t kBufferSize = 1024 * 1024;
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_filepath = data_path;
+    config.local_buffer_size = kBufferSize;
+    config.total_keys_limit = 1000;
+    config.use_uring = false;
+    FileStorage storage(config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageBatchOffload(storage, keys, sizes, batch_data));
+    ASSERT_FALSE(keys.empty());
+
+    const auto& key = keys.front();
+    auto first = storage.BatchGet({key}, {sizes.front()});
+    ASSERT_TRUE(first);
+    auto staging = ClientBufferBatch(storage, first->batch_id);
+    ASSERT_NE(staging, nullptr);
+    auto second = FileStorageShareStagingBuffer(storage, staging);
+    staging.reset();
+    ASSERT_NE(first->batch_id, second.batch_id);
+    ASSERT_EQ(first->pointers, second.pointers);
+    ASSERT_EQ(ClientBufferBatchCount(storage), 2u);
+
+    // A whole-pool allocation drives eager GC while the abandoned leases
+    // still own the shared staging buffer.
+    const std::vector<std::string> probe_keys = {key};
+    const std::vector<int64_t> probe_sizes = {kBufferSize};
+    auto probe = FileStorageAllocateBatch(storage, probe_keys, probe_sizes);
+    ASSERT_FALSE(probe);
+    EXPECT_EQ(probe.error(), ErrorCode::BUFFER_OVERFLOW);
+    EXPECT_EQ(ClientBufferBatchCount(storage), 2u);
+
+    ASSERT_TRUE(ExpireClientBufferBatch(storage, first->batch_id));
+    ASSERT_TRUE(ExpireClientBufferBatch(storage, second.batch_id));
+    EXPECT_TRUE(FileStorageAllocateBatch(storage, probe_keys, probe_sizes))
+        << "Expired leases should return staging memory to the pool";
+    EXPECT_EQ(ClientBufferBatchCount(storage), 0u);
+}
+
+class FileStorageReclaimTest
+    : public FileStorageTest,
+      public ::testing::WithParamInterface<ReclaimCase> {};
+
+TEST_P(FileStorageReclaimTest, Scenario) { RunReclaimScenario(GetParam()); }
+
+std::string ReclaimCaseName(const ::testing::TestParamInfo<ReclaimCase>& info) {
+    constexpr const char* kNames[] = {
+        "DeletesBucketOfRemovedObject", "OffloadsRePutKeyAfresh",
+        "KeepsLiveCopyOnRetriedTask",   "WaitsForRescanAfterSegmentLoss",
+        "ReopensAfterRemountRescan",    "PassFailsWhenQueryFails",
+        "DisabledOnNonEmptyDirectory",  "RunsWhenOffloadFails"};
+    return kNames[static_cast<int>(info.param)];
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Reclaim, FileStorageReclaimTest,
+    ::testing::Values(ReclaimCase::kRemoved, ReclaimCase::kRePut,
+                      ReclaimCase::kRetriedTask, ReclaimCase::kSegmentLost,
+                      ReclaimCase::kSegmentRemounted, ReclaimCase::kQueryFails,
+                      ReclaimCase::kExistingData, ReclaimCase::kOffloadFails),
+    ReclaimCaseName);
 
 }  // namespace mooncake

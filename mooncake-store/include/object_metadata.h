@@ -27,6 +27,8 @@
 #include <utility>
 #include <vector>
 
+#include <boost/container/small_vector.hpp>
+
 #include "common/heap_optional.h"
 #include "lease.h"
 #include "master_metric_manager.h"
@@ -60,6 +62,7 @@ struct ObjectMetadata {
     // RAII-style metric management
     ~ObjectMetadata() {
         MasterMetricManager::instance().dec_key_count(1);
+        MasterMetricManager::instance().dec_key_group(key_group, TotalLength());
         if (soft_pin_timeout) {
             MasterMetricManager::instance().dec_soft_pin_key_count(1);
         }
@@ -84,10 +87,13 @@ struct ObjectMetadata {
           residency_affinity_id(std::move(residency_affinity_id_)),
           tenant_id(std::move(tenant_id_)),
           user_key(std::move(user_key_)),
+          key_group(
+              MasterMetricManager::instance().classify_key_group(user_key)),
           soft_pin_timeout(std::move(committed_soft_pin_timeout)),
           hard_pinned(enable_hard_pin) {
         parts_.emplace_back(value_length, std::move(reps));
         MasterMetricManager::instance().inc_key_count(1);
+        MasterMetricManager::instance().inc_key_group(key_group, value_length);
         if (soft_pin_timeout) {
             MasterMetricManager::instance().inc_soft_pin_key_count(1);
         }
@@ -108,6 +114,7 @@ struct ObjectMetadata {
     const std::string residency_affinity_id;
     const TenantId tenant_id;
     const std::string user_key;
+    const uint8_t key_group;
 
     // Committed attribution only; protected by the key's lock.
     std::string session_id;
@@ -169,42 +176,88 @@ struct ObjectMetadata {
         bool complete{false};
     };
 
-    std::unordered_map<ReplicaID, DynamicReplicaRecord> dynamic_replicas;
-    std::chrono::steady_clock::time_point dynamic_replication_recreate_after{};
+    // Invalidated by a later Mark, Forget, Set, or Reclaim on this object:
+    // those calls may free the state. Use it only under the object lock,
+    // before the next mutation.
+    const std::unordered_map<ReplicaID, DynamicReplicaRecord>& DynamicReplicas()
+        const {
+        static const std::unordered_map<ReplicaID, DynamicReplicaRecord> kEmpty;
+        return dynamic_replica_state_ ? dynamic_replica_state_->replicas
+                                      : kEmpty;
+    }
+
+    // True while a replica record or a still-active recreate deadline is
+    // stored on the heap.
+    bool HasDynamicReplicaState() const {
+        return static_cast<bool>(dynamic_replica_state_);
+    }
 
     void MarkDynamicReplica(ReplicaID replica_id, DynamicReplicaRecord record) {
-        dynamic_replicas[replica_id] = std::move(record);
+        EnsureDynamicReplicaState().replicas[replica_id] = std::move(record);
     }
 
     void MarkDynamicReplicasComplete(
         const std::vector<ReplicaID>& replica_ids) {
+        if (!dynamic_replica_state_) {
+            return;
+        }
+        auto& replicas = dynamic_replica_state_->replicas;
         for (const auto& replica_id : replica_ids) {
-            auto it = dynamic_replicas.find(replica_id);
-            if (it != dynamic_replicas.end()) {
+            auto it = replicas.find(replica_id);
+            if (it != replicas.end()) {
                 it->second.complete = true;
             }
         }
     }
 
     size_t ForgetDynamicReplicas(const std::vector<ReplicaID>& replica_ids) {
+        if (!dynamic_replica_state_) {
+            return 0;
+        }
+        auto& replicas = dynamic_replica_state_->replicas;
         size_t forgotten = 0;
         for (const auto& replica_id : replica_ids) {
-            forgotten += dynamic_replicas.erase(replica_id);
+            forgotten += replicas.erase(replica_id);
         }
+        // erase() leaves the map's buckets behind. Drop them when the map is
+        // empty, and drop the deadline too once it has expired.
+        ReleaseDynamicReplicaStateIfIdle(std::chrono::steady_clock::now(),
+                                         /*discard_buckets=*/true);
         return forgotten;
     }
 
-    size_t DynamicReplicaCount() const { return dynamic_replicas.size(); }
+    size_t DynamicReplicaCount() const {
+        return dynamic_replica_state_ ? dynamic_replica_state_->replicas.size()
+                                      : 0;
+    }
 
     bool DynamicReplicationRecreateBlocked(
         std::chrono::steady_clock::time_point now) const {
-        return now < dynamic_replication_recreate_after;
+        const auto recreate_after =
+            dynamic_replica_state_ ? dynamic_replica_state_->recreate_after
+                                   : std::chrono::steady_clock::time_point{};
+        return now < recreate_after;
     }
 
     void SetDynamicReplicationRecreateAfter(
         std::chrono::steady_clock::time_point deadline) {
-        dynamic_replication_recreate_after =
-            std::max(dynamic_replication_recreate_after, deadline);
+        if (!dynamic_replica_state_) {
+            if (deadline == std::chrono::steady_clock::time_point{}) {
+                return;
+            }
+            dynamic_replica_state_.emplace();
+        }
+        auto& recreate_after = dynamic_replica_state_->recreate_after;
+        recreate_after = std::max(recreate_after, deadline);
+        ReleaseDynamicReplicaStateIfIdle(std::chrono::steady_clock::now(),
+                                         /*discard_buckets=*/false);
+    }
+
+    // Drops an empty state whose recreate deadline has expired. A deadline
+    // still in the future is kept. Call under the object's exclusive lock.
+    void ReclaimExpiredDynamicReplicaState(
+        std::chrono::steady_clock::time_point now) {
+        ReleaseDynamicReplicaStateIfIdle(now, /*discard_buckets=*/false);
     }
 
     // Read under the owner's shared lock, change under its exclusive lock. A
@@ -510,7 +563,45 @@ struct ObjectMetadata {
     }
 
    private:
-    std::vector<ObjectPart> parts_;
+    // Heap node for dynamic replication. Empty while the key has no replica
+    // record and no recreate deadline that is still in the future.
+    struct DynamicReplicaState {
+        std::unordered_map<ReplicaID, DynamicReplicaRecord> replicas;
+        std::chrono::steady_clock::time_point recreate_after{};
+    };
+    HeapOptional<DynamicReplicaState> dynamic_replica_state_;
+
+    DynamicReplicaState& EnsureDynamicReplicaState() {
+        if (!dynamic_replica_state_) {
+            dynamic_replica_state_.emplace();
+        }
+        return *dynamic_replica_state_;
+    }
+
+    // Map must be empty. An expired or unset deadline frees the node. A
+    // deadline still in the future stays; discard_buckets replaces the map
+    // so buckets left by erase() are freed.
+    void ReleaseDynamicReplicaStateIfIdle(
+        std::chrono::steady_clock::time_point now, bool discard_buckets) {
+        if (!dynamic_replica_state_ ||
+            !dynamic_replica_state_->replicas.empty()) {
+            return;
+        }
+        const auto deadline = dynamic_replica_state_->recreate_after;
+        if (now < deadline) {
+            if (!discard_buckets) {
+                return;
+            }
+            dynamic_replica_state_.reset();
+            dynamic_replica_state_.emplace();
+            dynamic_replica_state_->recreate_after = deadline;
+            return;
+        }
+        dynamic_replica_state_.reset();
+    }
+
+    // The first part sits in the object itself: every object has one today.
+    boost::container::small_vector<ObjectPart, 1> parts_;
 };
 
 }  // namespace mooncake

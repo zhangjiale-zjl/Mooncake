@@ -14,8 +14,11 @@
 
 #ifndef UB_TRANSPORT_H
 #define UB_TRANSPORT_H
+#include <chrono>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include "topology.h"
 #include "transfer_metadata.h"
@@ -37,6 +40,7 @@ class UbTransport : public Transport {
     friend class UbContext;
     friend class UbEndPoint;
     friend class UbWorkerPool;
+    friend class UbTransportTestPeer;
 
    public:
     using BufferDesc = TransferMetadata::BufferDesc;
@@ -47,6 +51,11 @@ class UbTransport : public Transport {
     UbTransport(UB_ENDPOINT_TYPE endpoint_type = URMA_ENDPOINT);
 
     ~UbTransport();
+
+    // True when the URMA transport should use RM (Reliable Message) mode,
+    // which is the only mode supported by UBoE (UB over Ethernet) devices.
+    // Selected via the MC_UB_TRANS_MODE=rm environment variable.
+    bool rmMode() const { return rm_mode_; }
 
     int install(std::string& local_server_name,
                 std::shared_ptr<TransferMetadata> meta,
@@ -81,6 +90,16 @@ class UbTransport : public Transport {
 
    private:
     int allocateLocalSegmentID();
+
+    // defer_publish: the caller (unregisterLocalMemoryBatch) publishes once
+    // for all members, so a finished member keeps a metadata-only chunk_map_
+    // entry until that publish succeeds.
+    int unregisterLocalMemoryInternal(void* addr, bool update_metadata,
+                                      bool defer_publish);
+
+    // Rate-limits forced SegmentDesc refreshes issued from submit paths; see
+    // kTargetRefreshCooldown.
+    bool tryBeginTargetRefresh(SegmentID target_id);
 
    public:
     int onSetupConnections(const HandShakeDesc& peer_desc,
@@ -117,7 +136,23 @@ class UbTransport : public Transport {
     std::vector<std::shared_ptr<UbContext>> context_list_;
     std::shared_ptr<Topology> local_topology_;
     UB_ENDPOINT_TYPE endpoint_type_;
+    bool rm_mode_ = false;
     bool urma_initialized_ = false;
+    // Mooncake#3503: buffers larger than max_seg_size are split into multiple
+    // <= max_seg_size URMA segments (one BufferDesc per chunk).
+    // unregisterLocalMemory() only receives the base addr, so this maps a
+    // base addr to the chunk start-addresses that still need cleanup:
+    //  - a live chunked registration: every chunk;
+    //  - an unfinished unregistration: the chunks whose URMA segments could
+    //    not be released, or an empty list when only the metadata publish is
+    //    still owed (a retry then republishes without touching segments).
+    // A successful registration at the same addr replaces any such entry.
+    std::mutex chunk_map_mutex_;
+    std::unordered_map<uint64_t, std::vector<uint64_t>> chunk_map_;
+
+    std::mutex target_refresh_mutex_;
+    std::unordered_map<SegmentID, std::chrono::steady_clock::time_point>
+        last_target_refresh_;
 };
 }  // namespace mooncake
 

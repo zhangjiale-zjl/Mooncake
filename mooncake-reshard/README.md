@@ -178,6 +178,71 @@ The sweep sorts unique allocations once instead of repeatedly comparing every
 pair of views in the same arena. View-overlap and declared-alias checks are
 unchanged; no persistent validation cache or new lifetime owner is introduced.
 
+## Optional Logical Plan Cache
+
+`WeightTransferPlanCache` is an explicit, process-local LRU for address-free
+local-target plans. It is disabled by default; existing planner, Reader, Sink,
+and Store callers do not read its environment variables or use it
+automatically. See [configuration and costs](plan_cache.md).
+
+`MC_RESHARD_PLAN_CACHE_ENABLED=1` enables the cache when the new same-fleet
+entry point is constructed. `MC_RESHARD_PLAN_CACHE_MAX_ENTRIES` sets a positive
+entry limit (default `2`). Limits count entries, not bytes, and every execution
+still obtains and validates fresh runtime bindings and allocation guards.
+
+## Explicit Same-Fleet Weight Transfer
+
+`InplaceWeightResharder(reader)` adds an opt-in entry point for complete source
+and target placements with the same participant ID set. It calls the existing
+local-target planner, binds the logical plan to the current runtime bindings,
+and executes through the supplied `MooncakeTransferEngineReader`. A configured
+cache can reuse only the logical plan; bound plans, addresses, leases and native
+engine state are not retained in that cache.
+
+The framework owner must stop source writes, discard KV, provision distinct
+target storage within its memory budget, and retain all source allocations
+until global completion. Same participants do not prove physical GPU identity
+or permit destructive overlapping writes. This helper does not allocate GPU
+weights, switch a production scheduler, provide a distributed completion fence,
+or automatically fall back after unknown completion. The reader's existing
+quarantine and allocation-lifetime contracts remain in force.
+
+`MooncakeTransferEngineReader(engine, transfer_executor=executor)` accepts an
+explicit executor with the same engine, no pending transfers, and matching
+completion-drain settings. Omitting it creates the original executor. A
+collective executor requires its caller to coordinate participant order and
+completion; local completion is not a world fence.
+
+The native `reset_reshard_peers_quiescent(peers)` method explicitly clears cached
+IPC mappings, metadata and Python handles only for the listed peers. An empty
+list is a no-op; unknown or repeated peers are harmless. The caller must first
+drain transfers on all participants, prevent concurrent registration, submission
+and unregistration,
+and fence completion. The method is not a drain or cancellation API. A failure
+may leave only some peers reset and requires restarting the participating
+engines. Existing GPU and DRAM transfer paths never invoke it automatically.
+
+The opt-in public-binding regression needs three CUDA GPUs and the built
+Mooncake extension. From the repository root, with `CUDA_HOME` set:
+
+```bash
+mkdir -p build
+c++ -shared -fPIC -std=c++17 -I"$CUDA_HOME/include" \
+  mooncake-integration/tests/reshard_ipc_trace.cpp -ldl \
+  -o build/reshard_ipc_trace.so
+CUDA_VISIBLE_DEVICES=0,1,2 MC_INTRANODE_NVLINK=1 MC_RUN_RESHARD_IPC_TESTS=1 \
+  LD_PRELOAD="$PWD/build/reshard_ipc_trace.so" \
+  python mooncake-integration/tests/test_reshard_peer_reset.py
+```
+
+The trace library observes real CUDA IPC calls and can fail one close operation.
+The failure test destroys the engine without resuming transfers; it does not
+validate recovery after an unknown transfer completion.
+
+Model parameter semantics, framework tensor layouts, packing policy, and
+serving lifecycle belong in the framework integration. They are not part of
+this model-independent entry point.
+
 ## Transfer Engine Execution
 
 `mooncake.reshard.transfer_engine` executes resource-neutral physical batches
@@ -323,6 +388,55 @@ lifetime. `KVCacheSnapshotDescriptor` independently describes model and token
 semantics. Legacy logical planning permits omission for compatibility; the
 Runtime-to-Runtime executor requires an explicit snapshot and operation ID.
 
+A descriptor defaults to `components=(KEY, VALUE)`. Single-component resources
+can declare `LATENT`, `CONV`, or `SSM`; their shard-unit width is `key_head_dim`
+(`value_head_dim` remains the width of `VALUE`). Components share the descriptor's
+layer set, dtype and ownership. Use separate resources for different dtypes or
+shard axes, such as a BF16 convolution buffer and an FP32 recurrent state.
+Existing K/V JSON and canonical identities remain unchanged.
+
+For MLA, declare one global latent unit and explicit TP replicas, so the planner
+chooses one source replica per target. For recurrent state, use `page_size=1`
+and let the framework map request slots to rows. GDN convolution Q/K/V groups
+must be separate resources because each group is independently TP-sharded.
+`NHD_STRIDED` permits a row pitch larger than its contiguous head/dimension
+payload; `nbytes` describes the physical span including gaps. Storage offsets
+can select a group within a fused allocation. The ordinary `NHD` contract
+continues to require dense rows. These are byte-copy layouts, not dtype
+conversion, quantization, or arbitrary tensor transposition.
+
+Overlap checks for equal row strides are independent of row capacity. Validation
+is capped at 1,000,000 candidate-pair/expanded-interval work units per call;
+mixed-stride layouts exceeding that budget fail before their rows are expanded.
+
+Bindings with independent lifetimes must register regions with
+`owner_id=binding.digest`. Validation and execution, including cached results,
+require that claim to remain active on every region. Omitting `owner_id` retains
+the legacy runtime-wide claim, which authorizes all matching local bindings until
+released. Other owner IDs can pin memory but do not authorize binding execution.
+
+The framework retains responsibility for token-page and state-slot mappings,
+cache lifetime, coordinating all resources, and withholding request completion
+until every required resource writer succeeds. Mooncake does not infer model
+architecture or treat recurrent state as token-indexed KV.
+
+For a recurrent-state operation, the snapshot's row interval identifies the
+selected state slots in a framework-defined logical order, not all tokens of
+the requests. Source and target must agree on that order and on the state
+checkpoint; the framework supplies fingerprints that bind those semantics.
+Physical slot IDs can differ: export resolved ranges mapping each logical row
+to its local slot, or use `resolve_contiguous_runtime_binding` with an explicit
+`first_token_offset` for a contiguous run of rows, including `NHD_STRIDED` views.
+Only the selected payload bytes are copied; padding and other fused groups
+remain untouched. One operation covers one resource, so a hybrid request with
+K/V, convolution and recurrent state needs a framework-level completion barrier
+across those resources.
+
+These extensions apply to runtime-to-runtime transfers. Store reshard currently
+accepts only `(KEY, VALUE)` with an `NHD` descriptor and rejects state resources
+and `NHD_STRIDED` descriptors. Existing K/V model-domain keys, Store layout and
+manifest identities, and JSON encodings are preserved.
+
 The KV-cache implementation is split by responsibility:
 
 - `snapshot.py` defines content identity;
@@ -344,6 +458,40 @@ maps target DP ranks round-robin over the source placement's available DP ranks.
 public JSON APIs. Their wire format contains only canonical fields, and
 deserialization rejects alternate field names rather than translating
 framework-specific input.
+
+## Weight reshard CPU overhead
+
+Weight planning and execution use call-local fragment indexes and membership
+sets to avoid repeated linear scans. Indexed lookups retain full fragment
+equality checks. Operation views share construction-time accumulators instead
+of repeatedly hashing executor keys containing long fragment tuples.
+
+Within one bind call, executor construction reuses runtime binding attestations
+created for the exact same placement and binding objects. This reuse does not
+cache validation across calls or extend allocation lifetimes. Canonical rank
+encoding retains the existing identity fields and serialized representation.
+
+Segment iteration advances N-dimensional offsets incrementally, with a direct
+range iterator for eligible one-dimensional regions. Batch lowering constructs
+bounded innermost runs for eligible canonical regions, advancing prefixes lazily
+and accumulating short runs within one operation up to the configured batch
+size. It preserves segment order and keeps different operations' allocation
+ranges separate. Custom region subclasses and unsupported stride
+or loop shapes continue through the segment iterator. Segment-budget rejection
+still occurs before a batch is produced; batching does not raise the budget.
+
+These implementation choices reduce Python bookkeeping while preserving
+coverage, bounds, canonical identities, and allocation lifetime contracts.
+Integer geometry normalization reuses exact immutable tuples only after checking
+every element and its minimum value. Lists and other supported sequences retain
+their existing normalization and validation behavior; no metadata is cached
+across bindings or generations.
+Strict geometry iteration uses the native `zip(strict=True)` implementation on
+Python 3.10 and newer, including its iterator construction and error semantics;
+the compatibility implementation remains available for older runtimes.
+End-to-end startup also includes framework initialization, model allocation,
+transport, and serving readiness; it must be measured separately from these
+CPU paths.
 
 Run the reshard tests from the repository root:
 

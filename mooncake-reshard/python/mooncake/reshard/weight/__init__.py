@@ -2,6 +2,7 @@
 
 from .tiled_coo import (
     BoundTiledCOOReadPlan,
+    TiledCOODenseFragment,
     TiledCOOIndexRange,
     TiledCOOLayout,
     TiledCOOPayloadRange,
@@ -9,6 +10,11 @@ from .tiled_coo import (
     TiledCOORecord,
     TiledCOOTileRun,
     plan_tiled_coo_read,
+)
+from .tiled_coo_structured import (
+    TiledCOOStructuredMembers,
+    tiled_coo_directory_ranges,
+    tiled_coo_payload_ranges,
 )
 from .manifest import (
     OwnershipAxis,
@@ -77,9 +83,14 @@ from .te import (
     WeightAllocationGuardProvider,
     WeightAllocationGuardProviders,
 )
+from .plan_cache import WeightTransferPlanCache
+from .inplace import InplaceWeightResharder
 
 __all__ = [
+    "WeightTransferPlanCache",
+    "InplaceWeightResharder",
     "BoundTiledCOOReadPlan",
+    "TiledCOODenseFragment",
     "TiledCOOIndexRange",
     "TiledCOOLayout",
     "TiledCOOPayloadRange",
@@ -87,6 +98,9 @@ __all__ = [
     "TiledCOORecord",
     "TiledCOOTileRun",
     "plan_tiled_coo_read",
+    "TiledCOOStructuredMembers",
+    "tiled_coo_directory_ranges",
+    "tiled_coo_payload_ranges",
     "ParallelRank",
     "ParallelTopology",
     "PlacementFragment",

@@ -25,6 +25,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -141,6 +142,13 @@ class RdmaContextTestPeer {
         context.cq_list_.clear();
     }
 
+    static std::shared_ptr<WorkerPool> bindWorkerPool(
+        RdmaContext &context, std::shared_ptr<WorkerPool> pool) {
+        auto previous = std::move(context.worker_pool_);
+        context.worker_pool_ = std::move(pool);
+        return previous;
+    }
+
     static void clearNativeCompletionQueue(RdmaContext &context, int cq_index) {
         ASSERT_GE(cq_index, 0);
         ASSERT_LT(static_cast<size_t>(cq_index), context.cq_list_.size());
@@ -162,16 +170,74 @@ class WorkerPoolTestPeer {
     static void queueSlice(WorkerPool &pool, int thread_id,
                            const std::string &peer_nic_path,
                            Transport::Slice *slice) {
-        pool.collective_slice_queue_[thread_id][peer_nic_path].push_back(slice);
+        pool.worker_slice_queue_[thread_id][peer_nic_path].push_back(slice);
+    }
+
+    static void setPendingSetup(WorkerPool &pool, const std::string &path,
+                                std::shared_ptr<RdmaEndPoint> endpoint,
+                                std::future<int> result) {
+        pool.pending_setups_[0][path] = {
+            std::move(endpoint), std::move(result),
+            std::chrono::steady_clock::now() + std::chrono::seconds(5)};
     }
 
     static void performPostSend(WorkerPool &pool, int thread_id) {
         pool.performPostSend(thread_id);
     }
 
+    static void waitForSetups(WorkerPool &pool) {
+        for (auto &owner : pool.pending_setups_)
+            for (auto &entry : owner)
+                if (entry.second.result.valid()) entry.second.result.wait();
+    }
+
+    static void expireSetups(WorkerPool &pool) {
+        for (auto &owner : pool.pending_setups_)
+            for (auto &entry : owner) entry.second.deadline = {};
+    }
+
+    static int railErrors(WorkerPool &pool, const std::string &path) {
+        return pool.rail_states_[path].error_count;
+    }
+
+    static void retry(WorkerPool &pool, Transport::Slice &slice) {
+        std::vector<Transport::Slice *> slices{&slice};
+        pool.redispatch(slices, 0);
+    }
+
+    static void pollRetries(WorkerPool &pool) {
+        pool.performPendingRedispatch(0);
+    }
+
+    static void waitForRetries(WorkerPool &pool) {
+        for (auto &entry : pool.pending_redispatch_[0])
+            if (entry.second.result.valid()) entry.second.result.wait();
+    }
+
+    static size_t pendingRetries(WorkerPool &pool) {
+        return pool.pending_redispatch_[0].size();
+    }
+
+    static void expireRetries(WorkerPool &pool) {
+        for (auto &entry : pool.pending_redispatch_[0])
+            entry.second.deadline = {};
+    }
+
     static void clearQueuedSlices(WorkerPool &pool) {
         for (auto &queue : pool.collective_slice_queue_) queue.clear();
         for (auto &queue : pool.worker_slice_queue_) queue.clear();
+    }
+
+    static size_t pendingSetups(WorkerPool &pool) {
+        return pool.pending_setups_[0].size();
+    }
+
+    static std::vector<Transport::Slice *> queuedSlices(
+        WorkerPool &pool, const std::string &path) {
+        const auto &queue = pool.collective_slice_queue_[0];
+        auto entry = queue.find(path);
+        return entry == queue.end() ? std::vector<Transport::Slice *>{}
+                                    : entry->second;
     }
 
     static uint64_t lastPollTs(const WorkerPool &pool) {
@@ -214,6 +280,78 @@ class WorkerPoolTestPeer {
 
 class RdmaEndPointTestPeer {
    public:
+    class FakePostSend {
+       public:
+        FakePostSend(RdmaEndPoint &endpoint, WorkerPool &pool,
+                     PeerAutoGidSelection selection = {})
+            : endpoint_(endpoint) {
+            EXPECT_TRUE(endpoint_.qp_list_.empty());
+            previous_pool_ = RdmaContextTestPeer::bindWorkerPool(
+                endpoint_.context_,
+                std::shared_ptr<WorkerPool>(&pool, [](WorkerPool *) {}));
+            verbs_.ops.post_send = postSend;
+            qp_.context = &verbs_;
+            qp_.qp_context = this;
+            delete[] endpoint_.wr_depth_list_;
+            endpoint_.wr_depth_list_ = new std::atomic<int>[1]();
+            endpoint_.qp_list_ = {&qp_};
+            endpoint_.posted_fifo_.assign(1, {});
+            endpoint_.max_wr_depth_ = 1;
+            endpoint_.status_.store(RdmaEndPoint::CONNECTED);
+            endpoint_.connected_auto_gid_ = std::move(selection);
+            token_ = endpoint_.autoGidCompletionToken();
+        }
+
+        FakePostSend(const FakePostSend &) = delete;
+        FakePostSend &operator=(const FakePostSend &) = delete;
+
+        ~FakePostSend() {
+            endpoint_.context_.untrackPostedSlices(posted, 0, posted.size());
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+            for (auto *slice : posted)
+                adaptive_congestion_control::complete(
+                    slice->rdma_congestion_control_permit,
+                    adaptive_congestion_control::OutcomeClass::kDerivedFlush,
+                    adaptive_congestion_control::FailureScope::kOperation);
+#endif
+            endpoint_.cq_outstanding_->fetch_sub(
+                endpoint_.wr_depth_list_[0].exchange(0));
+            endpoint_.posted_fifo_.clear();
+            endpoint_.qp_list_.clear();
+            RdmaContextTestPeer::bindWorkerPool(endpoint_.context_,
+                                                std::move(previous_pool_));
+        }
+
+        size_t calls = 0;
+        std::vector<Transport::Slice *> posted;
+
+       private:
+        static int postSend(ibv_qp *qp, ibv_send_wr *first, ibv_send_wr **bad) {
+            auto &probe = *static_cast<FakePostSend *>(qp->qp_context);
+            ++probe.calls;
+            for (auto *wr = first; wr; wr = wr->next) {
+                auto *slice = reinterpret_cast<Transport::Slice *>(wr->wr_id);
+                EXPECT_EQ(slice->rdma.endpoint, &probe.endpoint_);
+                EXPECT_EQ(slice->rdma.auto_gid_token.endpoint_id,
+                          probe.token_.endpoint_id);
+                EXPECT_EQ(slice->rdma.auto_gid_token.selection_epoch,
+                          probe.token_.selection_epoch);
+                EXPECT_EQ(slice->rdma.auto_gid_token.valid, probe.token_.valid);
+                EXPECT_EQ(slice->rdma.auto_gid_token.observe_success,
+                          probe.token_.observe_success);
+                probe.posted.push_back(slice);
+            }
+            *bad = nullptr;
+            return 0;
+        }
+
+        RdmaEndPoint &endpoint_;
+        std::shared_ptr<WorkerPool> previous_pool_;
+        ibv_context verbs_{};
+        ibv_qp qp_{};
+        Transport::Slice::RdmaCompletionToken token_{};
+    };
+
     static void setStatus(RdmaEndPoint &endpoint, RdmaEndPoint::Status status) {
         endpoint.status_.store(status, std::memory_order_relaxed);
     }
@@ -247,6 +385,16 @@ class InProcessRdmaTransport : public RdmaTransport {
         if (!local_desc.ready_ack) {
             auto lifecycle_lock = RdmaContextTestPeer::tryLockEndpointLifecycle(
                 *local_context_, local_desc.peer_nic_path);
+            // Posting passes may briefly reacquire the gate while the RPC runs.
+            // Still fail if a worker holds it throughout the handshake.
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::milliseconds(500);
+            while (!lifecycle_lock.owns_lock() &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+                lifecycle_lock = RdmaContextTestPeer::tryLockEndpointLifecycle(
+                    *local_context_, local_desc.peer_nic_path);
+            }
             if (!lifecycle_lock.owns_lock()) {
                 lifecycle_gate_was_free_.store(false,
                                                std::memory_order_release);
@@ -263,7 +411,7 @@ class InProcessRdmaTransport : public RdmaTransport {
                 })) {
                 return ERR_ENDPOINT;
             }
-            if (fail_after_barrier_) return ERR_ENDPOINT;
+            if (fail_after_barrier_) return failure_code_;
         }
 
         return peer_->onSetupRdmaConnections(local_desc, peer_desc);
@@ -285,6 +433,7 @@ class InProcessRdmaTransport : public RdmaTransport {
     InProcessRdmaTransport *peer_ = nullptr;
     std::shared_ptr<Barrier> barrier_;
     bool fail_after_barrier_ = false;
+    int failure_code_ = ERR_ENDPOINT;
 
    private:
     std::atomic<bool> lifecycle_gate_was_free_{true};
@@ -699,6 +848,9 @@ TEST(RdmaEndpointLifecycleGateTest,
     active_a.get();
     active_b.get();
 
+    WorkerPoolTestPeer::waitForSetups(*peer_a.worker_pool);
+    WorkerPoolTestPeer::waitForSetups(*peer_b.worker_pool);
+
     EXPECT_TRUE(peer_a.transport->lifecycleGateWasFree());
     EXPECT_TRUE(peer_b.transport->lifecycleGateWasFree());
 
@@ -713,8 +865,10 @@ TEST(RdmaEndpointLifecycleGateTest,
     WorkerPoolTestPeer::clearQueuedSlices(*peer_b.worker_pool);
 }
 
-TEST(RdmaEndpointLifecycleGateTest, ActiveHandshakeWaitDrainsOwnerCq) {
+TEST(RdmaEndpointLifecycleGateTest, PendingHandshakeAllowsPostingAndCqPolling) {
     auto barrier = std::make_shared<InProcessRdmaTransport::Barrier>();
+    barrier->required_arrivals =
+        3;  // Keep both peer RPCs blocked until released.
     FakeRdmaPeer peer;
 
     ASSERT_NO_FATAL_FAILURE(
@@ -724,6 +878,9 @@ TEST(RdmaEndpointLifecycleGateTest, ActiveHandshakeWaitDrainsOwnerCq) {
     const std::string peer_nic_path =
         MakeNicPath("rdma-drain-b:10000", "mlx5_drain_b");
     ASSERT_NO_FATAL_FAILURE(installZeroQpEndpoint(peer, peer_nic_path));
+    const std::string other_peer_path =
+        MakeNicPath("rdma-drain-c:10000", "mlx5_drain_c");
+    ASSERT_NO_FATAL_FAILURE(installZeroQpEndpoint(peer, other_peer_path));
 
     // The fake CQ is not a real verbs object. Clearing the native pointer keeps
     // the regression hardware-free while still proving the owner worker enters
@@ -735,23 +892,32 @@ TEST(RdmaEndpointLifecycleGateTest, ActiveHandshakeWaitDrainsOwnerCq) {
     Transport::TransferTask task;
     queueHandshakeSlice(peer, peer_nic_path, slice, task);
     slice.rdma.max_retry_cnt = 1;
+    Transport::Slice other_slice{};
+    Transport::TransferTask other_task;
+    queueHandshakeSlice(peer, other_peer_path, other_slice, other_task);
+    other_slice.rdma.max_retry_cnt = 1;
 
     auto active = std::async(std::launch::async, [&] {
+        WorkerPoolTestPeer::performPostSend(*peer.worker_pool, 0);
         WorkerPoolTestPeer::performPostSend(*peer.worker_pool, 0);
     });
 
     {
         std::unique_lock<std::mutex> lock(barrier->mutex);
-        ASSERT_TRUE(barrier->cv.wait_for(lock, std::chrono::seconds(5), [&] {
-            return barrier->arrivals >= 1;
+        EXPECT_TRUE(barrier->cv.wait_for(lock, std::chrono::seconds(1), [&] {
+            return barrier->arrivals >= 2;
         }));
     }
 
+    EXPECT_EQ(active.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::ready);
     EXPECT_TRUE(WorkerPoolTestPeer::waitForPollTs(*peer.worker_pool,
                                                   std::chrono::seconds(5)));
 
     {
         std::lock_guard<std::mutex> lock(barrier->mutex);
+        EXPECT_EQ(barrier->arrivals,
+                  2);  // One RPC per peer across both passes.
         barrier->released = true;
     }
     barrier->cv.notify_all();
@@ -760,7 +926,585 @@ TEST(RdmaEndpointLifecycleGateTest, ActiveHandshakeWaitDrainsOwnerCq) {
               std::future_status::ready);
     active.get();
 
+    WorkerPoolTestPeer::waitForSetups(*peer.worker_pool);
+    WorkerPoolTestPeer::performPostSend(*peer.worker_pool, 0);
+    EXPECT_EQ(slice.status, Transport::Slice::FAILED);
+    EXPECT_EQ(other_slice.status, Transport::Slice::FAILED);
     WorkerPoolTestPeer::clearQueuedSlices(*peer.worker_pool);
+}
+
+class PendingHandshakeTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        old_conn_pause_ttl_ = globalConfig().conn_pause_ttl_ms;
+        globalConfig().conn_pause_ttl_ms = 0;
+        const std::string name =
+            ::testing::UnitTest::GetInstance()->current_test_info()->name();
+        for (int i = 0; i < 2; ++i) {
+            const auto nic = std::to_string(i);
+            initFakePeer(peers[i], name + nic + ":10000", "local" + nic,
+                         barrier);
+            peers[i].transport->fail_after_barrier_ = true;
+            paths[i] = MakeNicPath(name + ":10000", "remote" + nic);
+            installZeroQpEndpoint(peers[i], paths[i]);
+        }
+    }
+    void TearDown() override {
+        release();
+        for (auto &peer : peers) {
+            if (!peer.worker_pool) continue;
+            WorkerPoolTestPeer::waitForSetups(*peer.worker_pool);
+            WorkerPoolTestPeer::clearQueuedSlices(*peer.worker_pool);
+        }
+        globalConfig().conn_pause_ttl_ms = old_conn_pause_ttl_;
+    }
+    void release() {
+        {
+            std::lock_guard<std::mutex> lock(barrier->mutex);
+            barrier->released = true;
+        }
+        barrier->cv.notify_all();
+    }
+    void queue(int i) {
+        queueHandshakeSlice(peers[i], paths[i], slices[i], tasks[i]);
+    }
+    void post(int i) {
+        WorkerPoolTestPeer::performPostSend(*peers[i].worker_pool, 0);
+    }
+    void wait(int i) {
+        WorkerPoolTestPeer::waitForSetups(*peers[i].worker_pool);
+    }
+    void expire(int i) {
+        WorkerPoolTestPeer::expireSetups(*peers[i].worker_pool);
+    }
+
+    std::shared_ptr<InProcessRdmaTransport::Barrier> barrier =
+        std::make_shared<InProcessRdmaTransport::Barrier>();
+    FakeRdmaPeer peers[2];
+    std::string paths[2];
+    Transport::Slice slices[2]{};
+    Transport::TransferTask tasks[2];
+    int old_conn_pause_ttl_ = 0;
+};
+
+TEST_F(PendingHandshakeTest, NoCreditLeavesPendingCompletionContextUntouched) {
+    auto endpoint = peers[0].context->findEndpoint(paths[0]);
+    RdmaEndPointTestPeer::FakePostSend posting(*endpoint,
+                                               *peers[0].worker_pool);
+    queue(0);
+    slices[0].length = 64;
+    slices[0].rdma.auto_gid_token = {999, 888, true, true};
+    auto *outstanding = peers[0].context->cqOutstandingCount(0);
+    outstanding->store(globalConfig().max_cqe);
+    post(0);
+    EXPECT_EQ(posting.calls, 0u);
+    EXPECT_EQ(outstanding->load(), globalConfig().max_cqe);
+    EXPECT_EQ(WorkerPoolTestPeer::queuedSlices(*peers[0].worker_pool, paths[0]),
+              (std::vector<Transport::Slice *>{&slices[0]}));
+    outstanding->store(0);
+
+    EXPECT_EQ(slices[0].status, Transport::Slice::PENDING);
+    EXPECT_EQ(slices[0].rdma.endpoint, nullptr);
+    EXPECT_EQ(slices[0].rdma.auto_gid_token.endpoint_id, 999u);
+    EXPECT_EQ(slices[0].rdma.auto_gid_token.selection_epoch, 888u);
+    EXPECT_TRUE(slices[0].rdma.auto_gid_token.valid);
+    EXPECT_TRUE(slices[0].rdma.auto_gid_token.observe_success);
+}
+
+TEST_F(PendingHandshakeTest, ConstructedPrefixGetsCurrentCompletionContext) {
+    auto endpoint = peers[0].context->findEndpoint(paths[0]);
+    for (bool recovery_enabled : {true, false}) {
+        SCOPED_TRACE(recovery_enabled);
+        char payload[64]{};
+        Transport::Slice candidates[3]{};
+        std::vector<Transport::Slice *> pending, failed;
+        for (auto &slice : candidates) {
+            slice.source_addr = payload;
+            slice.length = sizeof(payload);
+            slice.opcode = Transport::TransferRequest::WRITE;
+            slice.status = Transport::Slice::PENDING;
+            slice.rdma.auto_gid_token = {999, 888, true, true};
+            pending.push_back(&slice);
+        }
+        PeerAutoGidSelection selection;
+        selection.recovery_enabled = recovery_enabled;
+        selection.observe_success = true;
+        selection.selection_epoch = 7;
+        RdmaEndPointTestPeer::FakePostSend posting(
+            *endpoint, *peers[0].worker_pool, selection);
+        endpoint->submitPostSend(pending, failed);
+
+        EXPECT_EQ(posting.calls, 1u);
+        EXPECT_EQ(posting.posted,
+                  (std::vector<Transport::Slice *>{&candidates[0]}));
+        EXPECT_EQ(candidates[0].status, Transport::Slice::POSTED);
+        EXPECT_EQ(pending, (std::vector<Transport::Slice *>{&candidates[1],
+                                                            &candidates[2]}));
+        EXPECT_TRUE(failed.empty());
+        EXPECT_EQ(peers[0].context->cqOutstandingCount(0)->load(), 1);
+        for (auto *slice : pending) {
+            EXPECT_EQ(slice->status, Transport::Slice::PENDING);
+            EXPECT_EQ(slice->rdma.endpoint, nullptr);
+            EXPECT_EQ(slice->rdma.auto_gid_token.endpoint_id, 999u);
+            EXPECT_EQ(slice->rdma.auto_gid_token.selection_epoch, 888u);
+            EXPECT_TRUE(slice->rdma.auto_gid_token.valid);
+            EXPECT_TRUE(slice->rdma.auto_gid_token.observe_success);
+        }
+    }
+}
+
+TEST_F(PendingHandshakeTest, ShutdownWaitsForPendingHandshake) {
+    queue(0);
+    post(0);
+    auto shutdown =
+        std::async(std::launch::async, [&] { peers[0].worker_pool.reset(); });
+    EXPECT_EQ(shutdown.wait_for(std::chrono::milliseconds(20)),
+              std::future_status::timeout);
+    release();
+    EXPECT_EQ(shutdown.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    shutdown.get();
+}
+
+TEST_F(PendingHandshakeTest, RpcFailureIsIsolatedAcrossLocalRnics) {
+    globalConfig().conn_pause_ttl_ms = 10000;
+    peers[0].transport->failure_code_ = peers[1].transport->failure_code_ =
+        ERR_SOCKET;
+    queue(0);
+    queue(1);
+    post(0);
+    post(1);
+    // Only admission waits expire; an admitted RPC must consume its result.
+    expire(0);
+    expire(1);
+    post(0);
+    post(1);
+    EXPECT_EQ(slices[0].status, Transport::Slice::PENDING);
+    EXPECT_EQ(slices[1].status, Transport::Slice::FAILED);
+    release();
+    wait(0);
+    post(0);
+    EXPECT_EQ(slices[0].status, Transport::Slice::FAILED);
+    // New requests on either RNIC fail in cooldown without metadata retries.
+    for (int i = 0; i < 2; ++i) {
+        queue(i);
+        post(i);
+        EXPECT_EQ(slices[i].status, Transport::Slice::FAILED);
+        EXPECT_EQ(slices[i].rdma.retry_cnt, 0);
+    }
+    EXPECT_EQ(barrier->arrivals, 1);
+}
+
+TEST_F(PendingHandshakeTest, NewSubmissionDiscardsCompletedIdleSetup) {
+    release();
+    // An expired queue's RPC finished while idle; the next request needs a new
+    // RPC.
+    std::promise<int> old_result;
+    old_result.set_value(ERR_SOCKET);
+    WorkerPoolTestPeer::setPendingSetup(
+        *peers[0].worker_pool, paths[0],
+        peers[0].context->findEndpoint(paths[0]), old_result.get_future());
+    expire(0);
+    queue(0);
+    post(0);
+    wait(0);
+    EXPECT_EQ(barrier->arrivals, 1);
+}
+
+TEST_F(PendingHandshakeTest, CompletedSetupSurvivesOtherRnicCooldown) {
+    globalConfig().conn_pause_ttl_ms = 10000;
+    release();
+    auto endpoint = peers[0].context->findEndpoint(paths[0]);
+    std::promise<int> successful_setup;
+    WorkerPoolTestPeer::setPendingSetup(*peers[0].worker_pool, paths[0],
+                                        endpoint,
+                                        successful_setup.get_future());
+    queue(0);
+    post(0);
+    RdmaEndPointTestPeer::setStatus(*endpoint, RdmaEndPoint::CONNECTED);
+    successful_setup.set_value(0);
+    // Another RNIC fails after A connects, before A consumes its result.
+    peers[1].transport->failure_code_ = ERR_SOCKET;
+    queue(1);
+    post(1);
+    wait(1);
+    post(1);
+    EXPECT_EQ(slices[1].status, Transport::Slice::FAILED);
+    post(0);
+    EXPECT_EQ(slices[0].status, Transport::Slice::PENDING);
+    EXPECT_EQ(WorkerPoolTestPeer::pendingSetups(*peers[0].worker_pool), 0u);
+}
+
+TEST_F(PendingHandshakeTest, ExpiredSetupDoesNotUseReleasedAdmission) {
+    queue(0);
+    queue(1);
+    post(0);
+    post(1);
+    expire(1);
+    // Release admission after B's deadline, without arming an RPC cooldown.
+    release();
+    wait(0);
+    post(1);
+    wait(1);
+    EXPECT_EQ(slices[1].status, Transport::Slice::FAILED);
+    EXPECT_EQ(barrier->arrivals, 1);
+}
+
+TEST_F(PendingHandshakeTest, PassiveConnectionBypassesPendingAdmission) {
+    queue(0);
+    queue(1);
+    post(0);
+    post(1);
+    // An incoming handshake connects B while A still owns server admission.
+    auto endpoint = peers[1].context->findEndpoint(paths[1]);
+    RdmaEndPointTestPeer::setStatus(*endpoint, RdmaEndPoint::CONNECTED);
+    expire(1);
+    post(1);
+    EXPECT_EQ(slices[1].status, Transport::Slice::PENDING);
+    EXPECT_EQ(WorkerPoolTestPeer::pendingSetups(*peers[1].worker_pool), 0u);
+    release();
+    wait(0);
+    EXPECT_EQ(barrier->arrivals, 1);
+}
+
+TEST_F(PendingHandshakeTest, InFlightDeadlinePreservesPassiveAndNewSlices) {
+    auto endpoint = peers[0].context->findEndpoint(paths[0]);
+    std::promise<int> result;
+    WorkerPoolTestPeer::setPendingSetup(*peers[0].worker_pool, paths[0],
+                                        endpoint, result.get_future());
+    queue(0);
+    post(0);
+    expire(0);
+    RdmaEndPointTestPeer::setStatus(*endpoint, RdmaEndPoint::CONNECTED);
+    Transport::Slice fresh{};
+    Transport::TransferTask fresh_task;
+    queueHandshakeSlice(peers[0], paths[0], fresh, fresh_task);
+    post(0);
+    EXPECT_EQ(slices[0].status, Transport::Slice::PENDING);
+    EXPECT_EQ(fresh.status, Transport::Slice::PENDING);
+    result.set_value(0);
+    post(0);
+    EXPECT_EQ(WorkerPoolTestPeer::pendingSetups(*peers[0].worker_pool), 0u);
+    EXPECT_EQ(slices[0].status, Transport::Slice::PENDING);
+    EXPECT_EQ(fresh.status, Transport::Slice::PENDING);
+}
+
+TEST_F(PendingHandshakeTest, NewSlicesDoNotInheritExpiredAdmission) {
+    queue(0);
+    queue(1);
+    post(0);
+    post(1);
+    expire(1);
+    Transport::Slice fresh{};
+    Transport::TransferTask fresh_task;
+    queueHandshakeSlice(peers[1], paths[1], fresh, fresh_task);
+    post(1);
+    EXPECT_EQ(slices[1].status, Transport::Slice::FAILED);
+    EXPECT_EQ(fresh.status, Transport::Slice::PENDING);
+    EXPECT_EQ(fresh.rdma.retry_cnt, 0);
+}
+
+TEST_F(PendingHandshakeTest, IdleNonRpcErrorsRetireTheirEndpoint) {
+    for (int error : {ERR_ENDPOINT, ERR_REJECT_HANDSHAKE}) {
+        auto endpoint = peers[0].context->findEndpoint(paths[0]);
+        std::promise<int> result;
+        result.set_value(error);
+        WorkerPoolTestPeer::setPendingSetup(*peers[0].worker_pool, paths[0],
+                                            endpoint, result.get_future());
+        const int errors =
+            WorkerPoolTestPeer::railErrors(*peers[0].worker_pool, paths[0]);
+        post(0);
+        EXPECT_EQ(peers[0].context->findEndpoint(paths[0]), nullptr);
+        EXPECT_EQ(
+            WorkerPoolTestPeer::railErrors(*peers[0].worker_pool, paths[0]),
+            errors + 1);
+        installZeroQpEndpoint(peers[0], paths[0]);
+    }
+}
+
+TEST_F(PendingHandshakeTest, IdleFailureDoesNotRetireReplacement) {
+    auto old = peers[0].context->findEndpoint(paths[0]);
+    std::promise<int> result;
+    result.set_value(ERR_ENDPOINT);
+    WorkerPoolTestPeer::setPendingSetup(*peers[0].worker_pool, paths[0], old,
+                                        result.get_future());
+    peers[0].context->deleteEndpointByPtr(old.get());
+    installZeroQpEndpoint(peers[0], paths[0]);
+    auto replacement = peers[0].context->findEndpoint(paths[0]);
+    post(0);
+    EXPECT_EQ(peers[0].context->findEndpoint(paths[0]), replacement);
+    EXPECT_EQ(WorkerPoolTestPeer::railErrors(*peers[0].worker_pool, paths[0]),
+              0);
+}
+
+TEST_F(PendingHandshakeTest, ZeroTtlAllowsNextHandshakeAfterRpcFailure) {
+    release();
+    peers[0].transport->failure_code_ = ERR_SOCKET;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        queue(0);
+        post(0);
+        wait(0);
+        post(0);
+        EXPECT_EQ(slices[0].status, Transport::Slice::FAILED);
+        EXPECT_EQ(barrier->arrivals, attempt + 1);
+    }
+}
+
+namespace {
+class BlockingMetadataStorage : public MetadataStoragePlugin {
+   public:
+    bool get(const std::string &key, Json::Value &value) override {
+        return getWithStatus(key, value) == GetResult::kFound;
+    }
+    GetResult getWithStatus(const std::string &key,
+                            Json::Value &value) override {
+        std::unique_lock<std::mutex> lock(mutex);
+        ++reads;
+        cv.notify_all();
+        if (!cv.wait_for(lock, std::chrono::seconds(5),
+                         [&] { return !held; }) ||
+            fail)
+            return GetResult::kUnavailable;
+        auto it = values.find(key);
+        if (it == values.end()) return GetResult::kNotFound;
+        value = it->second;
+        return GetResult::kFound;
+    }
+    bool set(const std::string &key, const Json::Value &value) override {
+        std::lock_guard<std::mutex> lock(mutex);
+        values[key] = value;
+        return true;
+    }
+    bool remove(const std::string &key) override {
+        std::lock_guard<std::mutex> lock(mutex);
+        values.erase(key);
+        return true;
+    }
+    void hold(bool fail_fetch = false) {
+        std::lock_guard<std::mutex> lock(mutex);
+        held = true;
+        fail = fail_fetch;
+        reads = 0;
+    }
+    void release() {
+        std::lock_guard<std::mutex> lock(mutex);
+        held = false;
+        cv.notify_all();
+    }
+    bool waitForRead() {
+        std::unique_lock<std::mutex> lock(mutex);
+        return cv.wait_for(lock, std::chrono::seconds(1),
+                           [&] { return reads > 0; });
+    }
+    std::atomic<int> reads{0};
+
+   private:
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::unordered_map<std::string, Json::Value> values;
+    bool held = false;
+    bool fail = false;
+};
+
+class MetadataWithStorage : public TransferMetadata {
+   public:
+    explicit MetadataWithStorage(std::shared_ptr<MetadataStoragePlugin> storage)
+        : TransferMetadata(std::move(storage)) {}
+};
+}  // namespace
+
+class MetadataRetryTest : public PendingHandshakeTest {
+   protected:
+    void SetUp() override {
+        old_metacache = globalConfig().metacache;
+        old_interval = globalConfig().te_metadata_refresh_interval_seconds;
+        globalConfig().metacache = true;
+        globalConfig().te_metadata_refresh_interval_seconds = 0;
+        PendingHandshakeTest::SetUp();
+        storage = std::make_shared<BlockingMetadataStorage>();
+        auto metadata = std::make_shared<MetadataWithStorage>(storage);
+        peers[0].metadata = metadata;
+        RdmaTransportTestPeer::bindMetadata(*peers[0].transport, metadata,
+                                            peers[0].server_name);
+        desc.name = getServerNameFromNicPath(paths[0]);
+        desc.protocol = "rdma";
+        desc.devices.push_back({"remote0", 0, "::1", ""});
+        ASSERT_EQ(desc.topology.parse("{\"cpu:0\":[[\"remote0\"],[]]}"), 0);
+        TransferMetadata::BufferDesc buffer{};
+        buffer.name = "cpu:0";
+        buffer.addr = 0x1000;
+        buffer.length = 4096;
+        buffer.rkey = {111};
+        buffer.lkey = {1};
+        desc.buffers.push_back(buffer);
+        ASSERT_EQ(metadata->updateSegmentDesc(desc.name, desc), 0);
+        id = metadata->getSegmentID(desc.name);
+        ASSERT_NE(id, static_cast<SegmentID>(-1));
+        queue(0);
+        WorkerPoolTestPeer::clearQueuedSlices(*peers[0].worker_pool);
+        slices[0].target_id = id;
+        slices[0].rdma.dest_addr = 0x1000;
+        slices[0].length = 64;
+        slices[0].rdma.dest_rkey = 111;
+        slices[0].rdma.retry_cnt = 1;
+        auto endpoint = peers[0].context->findEndpoint(paths[0]);
+        RdmaEndPointTestPeer::setStatus(*endpoint, RdmaEndPoint::CONNECTED);
+    }
+    void TearDown() override {
+        if (storage) storage->release();
+        if (peers[0].worker_pool)
+            WorkerPoolTestPeer::waitForRetries(*peers[0].worker_pool);
+        PendingHandshakeTest::TearDown();
+        globalConfig().metacache = old_metacache;
+        globalConfig().te_metadata_refresh_interval_seconds = old_interval;
+    }
+    void startRefresh(bool fail = false) {
+        storage->hold(fail);
+        WorkerPoolTestPeer::retry(*peers[0].worker_pool, slices[0]);
+        WorkerPoolTestPeer::pollRetries(*peers[0].worker_pool);
+        ASSERT_TRUE(storage->waitForRead());
+    }
+    void finishRefresh() {
+        storage->release();
+        WorkerPoolTestPeer::waitForRetries(*peers[0].worker_pool);
+        post(0);
+    }
+    void checkRecovery() {
+        desc.buffers[0].rkey[0] = 222;
+        ASSERT_EQ(peers[0].metadata->updateSegmentDesc(desc.name, desc), 0);
+        startRefresh();
+        WorkerPoolTestPeer::expireRetries(*peers[0].worker_pool);
+        // A different peer on the same posting worker still reaches posting.
+        const auto healthy_path =
+            MakeNicPath(desc.name + "-healthy", "remote0");
+        installZeroQpEndpoint(peers[0], healthy_path);
+        auto healthy_ep = peers[0].context->findEndpoint(healthy_path);
+        RdmaEndPointTestPeer::setStatus(*healthy_ep, RdmaEndPoint::CONNECTED);
+        Transport::Slice healthy{};
+        Transport::TransferTask healthy_task;
+        char payload[64]{};
+        healthy.source_addr = payload;
+        healthy.length = sizeof(payload);
+        healthy.opcode = Transport::TransferRequest::WRITE;
+        queueHandshakeSlice(peers[0], healthy_path, healthy, healthy_task);
+        {
+            RdmaEndPointTestPeer::FakePostSend posting(*healthy_ep,
+                                                       *peers[0].worker_pool);
+            post(0);
+            EXPECT_EQ(posting.posted,
+                      (std::vector<Transport::Slice *>{&healthy}));
+            EXPECT_EQ(healthy.status, Transport::Slice::POSTED);
+        }
+        EXPECT_EQ(slices[0].rdma.dest_rkey, 111u);
+        EXPECT_EQ(slices[0].rdma.retry_cnt, 1);
+        EXPECT_EQ(storage->reads, 1);
+        finishRefresh();
+        EXPECT_EQ(slices[0].rdma.dest_rkey, 222u);
+        EXPECT_EQ(slices[0].status, Transport::Slice::PENDING);
+        EXPECT_EQ(slices[0].rdma.retry_cnt, 1);
+        EXPECT_EQ(WorkerPoolTestPeer::pendingRetries(*peers[0].worker_pool),
+                  0u);
+        WorkerPoolTestPeer::clearQueuedSlices(*peers[0].worker_pool);
+    }
+    std::shared_ptr<BlockingMetadataStorage> storage;
+    TransferMetadata::SegmentDesc desc{};
+    SegmentID id = 0;
+    bool old_metacache = true;
+    uint64_t old_interval = 0;
+};
+
+TEST_F(MetadataRetryTest, CurrentRetryUsesRefreshedRkeyWithoutAnotherSubmit) {
+    checkRecovery();
+}
+
+TEST_F(MetadataRetryTest, DisabledMetacacheStillRefreshesOutsideWorker) {
+    globalConfig().metacache = false;
+    checkRecovery();
+}
+
+TEST_F(MetadataRetryTest, FetchFailureFallsBackWithoutPoisoningSubmissions) {
+    auto cached = peers[0].metadata->getCachedSegmentDescByID(id);
+    startRefresh(true);
+    finishRefresh();
+    EXPECT_EQ(slices[0].rdma.dest_rkey, 111u);
+    EXPECT_EQ(slices[0].status, Transport::Slice::PENDING);
+    EXPECT_EQ(peers[0].metadata->getSegmentDescByID(id), cached);
+    EXPECT_EQ(peers[0].metadata->getSegmentDescByID(id), cached);
+    EXPECT_EQ(storage->reads, 1);
+
+    // The same transfer can refresh again after a transient backend failure.
+    WorkerPoolTestPeer::clearQueuedSlices(*peers[0].worker_pool);
+    desc.buffers[0].rkey[0] = 222;
+    ASSERT_EQ(peers[0].metadata->updateSegmentDesc(desc.name, desc), 0);
+    startRefresh();
+    finishRefresh();
+    EXPECT_EQ(slices[0].rdma.dest_rkey, 222u);
+    EXPECT_EQ(slices[0].status, Transport::Slice::PENDING);
+    EXPECT_EQ(slices[0].rdma.retry_cnt, 1);
+}
+
+TEST_F(MetadataRetryTest, NewRetryDoesNotInheritExpiredAdmission) {
+    auto &pool = *peers[0].worker_pool;
+    storage->hold();
+    queue(1);
+    post(1);  // The other RNIC owns this server's RPC slot.
+    WorkerPoolTestPeer::retry(pool, slices[0]);
+    WorkerPoolTestPeer::pollRetries(pool);
+    WorkerPoolTestPeer::expireRetries(pool);
+
+    Transport::Slice fresh{};
+    Transport::TransferTask task;
+    queueHandshakeSlice(peers[0], paths[0], fresh, task);
+    WorkerPoolTestPeer::clearQueuedSlices(pool);
+    fresh.target_id = id;
+    fresh.rdma.dest_addr = 0x1000;
+    fresh.length = 64;
+    WorkerPoolTestPeer::retry(pool, fresh);
+    WorkerPoolTestPeer::pollRetries(pool);
+    EXPECT_EQ(slices[0].status, Transport::Slice::FAILED);
+    EXPECT_EQ(fresh.status, Transport::Slice::PENDING);
+    EXPECT_EQ(storage->reads, 0);
+
+    release();
+    wait(1);
+    WorkerPoolTestPeer::pollRetries(pool);
+    ASSERT_TRUE(storage->waitForRead());
+    finishRefresh();
+    EXPECT_EQ(fresh.rdma.dest_rkey, 111u);
+    EXPECT_EQ(fresh.status, Transport::Slice::PENDING);
+}
+
+TEST_F(MetadataRetryTest, ConcurrentRemovalDoesNotReuseDeletedDescriptor) {
+    startRefresh();
+    ASSERT_EQ(peers[0].metadata->removeLocalSegment(desc.name), 0);
+    finishRefresh();
+    EXPECT_EQ(slices[0].status, Transport::Slice::FAILED);
+    EXPECT_EQ(peers[0].metadata->getCachedSegmentDescByID(id), nullptr);
+}
+
+TEST_F(MetadataRetryTest, RefreshAndHandshakeShareServerAdmissionAcrossRnics) {
+    startRefresh();
+    queue(1);
+    post(1);
+    EXPECT_EQ(barrier->arrivals, 0);
+    EXPECT_EQ(slices[1].status, Transport::Slice::PENDING);
+    finishRefresh();
+    release();
+    post(1);
+    wait(1);
+    EXPECT_EQ(barrier->arrivals, 1);
+}
+
+TEST_F(MetadataRetryTest, ShutdownWaitsForMetadataRpc) {
+    startRefresh();
+    auto shutdown =
+        std::async(std::launch::async, [&] { peers[0].worker_pool.reset(); });
+    EXPECT_EQ(shutdown.wait_for(std::chrono::milliseconds(20)),
+              std::future_status::timeout);
+    storage->release();
+    EXPECT_EQ(shutdown.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    shutdown.get();
 }
 
 TEST_F(RdmaEndPointStateTest, ActiveAdvisoryAdvancesOnceAndBindsSelectedGid) {

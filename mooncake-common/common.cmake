@@ -64,6 +64,7 @@ if(SCCACHE AND ENABLE_SCCACHE)
   message(STATUS "Building with SCCACHE enabled")
   set(CMAKE_C_COMPILER_LAUNCHER ${SCCACHE})
   set(CMAKE_CXX_COMPILER_LAUNCHER ${SCCACHE})
+  set(CMAKE_CUDA_COMPILER_LAUNCHER ${SCCACHE})
 endif()
 
 add_compile_definitions(GLOG_USE_GLOG_EXPORT)
@@ -104,7 +105,7 @@ endif()
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
 option(USE_BAREX "option for using accl-barex transport" OFF)
-option(USE_ASCEND "option for using npu with HCCL" OFF)
+option(USE_ASCEND "option for using npu with Ascend Direct transport" OFF)
 option(USE_ASCEND_DIRECT "option for using ascend npu with adxl engine" OFF)
 option(USE_UBSHMEM "option for using ascend npu with shmem" OFF)
 option(USE_ASCEND_HETEROGENEOUS
@@ -113,8 +114,18 @@ option(USE_MNNVL "option for using Multi-Node NVLink transport" OFF)
 option(USE_CXL "option for using CXL protocol" OFF)
 option(USE_EFA "option for using AWS EFA transport" OFF)
 option(USE_UB "option for using UB protocol transport" OFF)
+option(
+  USE_UB_MOCK
+  "test-only: build TENT UB with an in-process loopback URMA adapter, enabled at runtime by MC_TENT_UB_MOCK=1; never use in production builds"
+  OFF)
+if(USE_UB_MOCK AND NOT USE_UB)
+  message(FATAL_ERROR "USE_UB_MOCK requires USE_UB=ON")
+endif()
 option(USE_SUNRISE
        "option for enabling gpu features for Sunrise GPU with Tang runtime" OFF)
+option(USE_ENFLAME
+       "option for enabling gpu features for Enflame GCU with TopsRider runtime"
+       OFF)
 option(
   USE_TPU
   "option for enabling TPU (PJRT) staging support in TENT; the PJRT adapter is loaded at runtime via dlopen, no build-time SDK required"
@@ -135,6 +146,14 @@ option(USE_FABRIC
 option(USE_SHCA "option for using ScaleFabric SHCA InfiniBand" OFF)
 option(USE_HYLINK "option for enabling hylink transport for Hygon DCU/DTK" OFF)
 option(USE_MEMFABRIC "option for using memfabric transport" OFF)
+option(USE_NDS "Build the TENT NPU Direct Storage transport" OFF)
+
+# USE_ASCEND and USE_ASCEND_DIRECT both select the Ascend Direct transport; the
+# HCCL transport it used to select is no longer built. Keep the two switches
+# equivalent so existing build commands work either way.
+if(USE_ASCEND)
+  set(USE_ASCEND_DIRECT ON)
+endif()
 
 if(USE_UB)
   add_compile_definitions(USE_UB)
@@ -222,6 +241,9 @@ option(USE_EVENT_DRIVEN_COMPLETION
        "option for using event-driven completion (store & transfer engine)" OFF)
 
 option(USE_TENT "option for building Mooncake TENT" OFF)
+if(USE_NDS AND NOT USE_TENT)
+  message(FATAL_ERROR "USE_NDS requires USE_TENT=ON")
+endif()
 option(ENABLE_MULTI_PROTOCOL
        "option for enabling multi-protocol support in transfer engine" OFF)
 if(ENABLE_MULTI_PROTOCOL)
@@ -487,6 +509,27 @@ if(USE_SUNRISE)
   include_directories(${MC_TANGRT_ROOT}/include)
 endif()
 
+if(NOT DEFINED MC_TOPS_PATH OR MC_TOPS_PATH STREQUAL "")
+  if(DEFINED ENV{TOPS_PATH} AND NOT "$ENV{TOPS_PATH}" STREQUAL "")
+    set(MC_TOPS_PATH
+        "$ENV{TOPS_PATH}"
+        CACHE PATH "Path to Enflame TopsRider SDK" FORCE)
+  else()
+    set(MC_TOPS_PATH
+        "/opt/tops"
+        CACHE PATH "Path to Enflame TopsRider SDK" FORCE)
+  endif()
+endif()
+
+if(USE_ENFLAME)
+  add_compile_definitions(USE_ENFLAME)
+  message(STATUS "Enflame GCU (TopsRider) support is enabled")
+  # tops_runtime_api.h / driver_types.h / efdrv.h 均平铺在 <tops>/include 下。
+  # Runtime libs: libtopsrt.so (tops*) + libefrt.so (efdrv*)。
+  include_directories(${MC_TOPS_PATH}/include)
+  link_directories(${MC_TOPS_PATH}/lib)
+endif()
+
 if(USE_MUSA)
   add_compile_definitions(USE_MUSA)
   message(STATUS "MUSA support is enabled")
@@ -727,8 +770,6 @@ if(USE_ASCEND
 endif()
 
 if(USE_ASCEND)
-  set(ASCEND_DEVLIB_DIR "${ASCEND_TOOLKIT_ROOT}/devlib")
-  link_directories(${ASCEND_DEVLIB_DIR})
   add_compile_definitions(USE_ASCEND)
 endif()
 
@@ -779,11 +820,6 @@ endif()
 if(USE_3FS)
   add_compile_definitions(USE_3FS)
   message(STATUS "3FS storage backend is enabled")
-endif()
-
-if(EXISTS "/usr/include/boost1.78")
-  include_directories(SYSTEM "/usr/include/boost1.78")
-  link_directories("/usr/lib64/boost1.78")
 endif()
 
 set(GFLAGS_USE_TARGET_NAMESPACE "true")

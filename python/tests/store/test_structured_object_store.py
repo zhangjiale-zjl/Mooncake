@@ -1505,6 +1505,45 @@ def test_append_rejects_conflicting_group_before_write() -> None:
     assert len(store.put_configs) == before_puts
 
 
+@pytest.mark.parametrize("direct_value", [False, True])
+def test_put_object_preserves_zero_dimensional_ndarray(direct_value) -> None:
+    _store, transfer = make_transfer()
+    array = np.array(1.5, dtype=np.float32)
+    value = array if direct_value else {"value": array}
+
+    result = transfer.get_object(transfer.put_object(value))
+    result = result if direct_value else result["value"]
+
+    assert result.shape == ()
+    assert result.dtype == array.dtype
+    np.testing.assert_array_equal(result, array)
+
+
+@pytest.mark.parametrize("use_pool", [False, True])
+@pytest.mark.parametrize(
+    "array",
+    [
+        pytest.param(np.array(1.5, dtype=np.float32), id="scalar-float"),
+        pytest.param(np.array(7, dtype=np.int64), id="scalar-int"),
+        pytest.param(np.array(True), id="scalar-bool"),
+    ],
+)
+def test_structured_object_preserves_zero_dimensional_ndarray(array, use_pool) -> None:
+    _store, transfer = make_transfer(buffer_pool=FakeBufferPool() if use_pool else None)
+    ref = transfer.put_structured_object(structured_payload(value=array), chunk_bytes=3)
+    spec = transfer.read_spec(ref)
+
+    result = transfer.materialize(spec).objects["value"]
+    assert result.shape == array.shape
+    assert result.dtype == array.dtype
+    np.testing.assert_array_equal(result, array)
+
+    destination = np.empty_like(array, order="C")
+    result = transfer.materialize_into(spec, {"value": destination}).objects["value"]
+    assert result is destination
+    np.testing.assert_array_equal(destination, array)
+
+
 def test_put_object_roundtrips_numpy_and_torch_tensor_fields() -> None:
     torch = pytest.importorskip("torch")
     store, transfer = make_transfer()
@@ -2610,6 +2649,22 @@ def test_dataproto_matrix_row_only_uses_one_ranged_call() -> None:
     assert np.array_equal(result["left"], left[[4]])
     assert np.array_equal(result["right"], right[[4]])
     assert store.get_into_ranges_calls == before_calls + 1
+
+
+def test_batched_ranges_handle_empty_chunks_and_preserve_fragment_cap() -> None:
+    store, transfer = make_transfer(buffer_pool=FakeBufferPool())
+    parts = [b"", b"ab", b"", b"cde", b""]
+    chunks = []
+    for index, data in enumerate(parts):
+        key = f"part-{index}"
+        store.objects[key] = data
+        chunks.append({"key": key, "bytes": len(data)})
+    requests = [({"chunks": chunks}, [(2, 0, 3), (1, 3, 2), (2, 5, 1)])]
+
+    assert transfer._transport.read_payload_ranges_batch(requests, 3) is None
+    assert store.get_into_ranges_calls == 0
+    assert transfer._transport.read_payload_ranges_batch(requests, 4) == [b"cdebcc"]
+    assert store.get_into_ranges_calls == 1
 
 
 def test_dataproto_matrix_range_cap_falls_back(monkeypatch) -> None:
@@ -4585,6 +4640,32 @@ def test_dataproto_helper_bool_list_rows_with_empty_row_keep_bool_values() -> No
     values = result["non_tensor_batch"]["flags"].tolist()
     assert values == [[True, False], []]
     assert all(isinstance(item, bool) for row in values for item in row)
+
+
+@pytest.mark.parametrize("explicit_schema", [False, True])
+@pytest.mark.parametrize(
+    "values",
+    [
+        [{1: "one", -2: {3: "nested"}}, {4: "four"}],
+        [{1: "one", -2: {3: "nested"}}, None],
+        [{"outer": {1: "one"}}, {"outer": {2: "two"}}],
+    ],
+)
+def test_dataproto_msgpack_preserves_integer_map_keys(values, explicit_schema) -> None:
+    _store, transfer = make_transfer()
+    rows = np.empty(len(values), dtype=object)
+    rows[:] = values
+    schemas = (
+        {"mapping": FieldSchema(codec="msgpack_ragged")} if explicit_schema else None
+    )
+    ref = transfer.put_dataproto(
+        SimpleDataProto(non_tensor_batch={"mapping": rows}),
+        field_schemas=schemas,
+    )
+
+    assert ref.encoded_non_tensor["mapping"]["codec"] == "msgpack_ragged"
+    result = transfer.get_dataproto(ref)
+    assert result["non_tensor_batch"]["mapping"].tolist() == values
 
 
 def test_msgpack_ragged_decode_validates_row_count() -> None:

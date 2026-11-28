@@ -13,12 +13,17 @@
 // limitations under the License.
 
 #include <glog/logging.h>
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include "config.h"
 #include "transport/kunpeng_transport/urma/urma_endpoint.h"
 
 namespace mooncake {
+// Default depth for jfr/jfs. Real UB keeps 2048; UBoE caps may be at 2047, so
+// RM mode takes min(device capability, URMA_DEFAULT_JETTY_DEPTH) at runtime.
+static constexpr uint32_t URMA_DEFAULT_JETTY_DEPTH = 2048;
+
 static int isNullEid(urma_eid_t* eid) {
     for (int i = 0; i < URMA_EID_SIZE; ++i) {
         if (eid->raw[i] != 0) return 0;
@@ -131,12 +136,16 @@ int UrmaContext::construct(GlobalConfig& config) {
     }
     jfr_list_.resize(num_jfc_list);
     urma_jfr_cfg_t jfr_cfg[num_jfc_list] = {};
-    /* one-side write/read, jfr no used */
+    /* one-side write/read, jfr used as receive side in RM mode */
+    const uint32_t jfr_depth =
+        engine_.rmMode() ? std::min(dev_attr_.dev_cap.max_jfr_depth,
+                                    (uint32_t)URMA_DEFAULT_JETTY_DEPTH)
+                         : (uint32_t)URMA_DEFAULT_JETTY_DEPTH;
     for (size_t i = 0; i < num_jfc_list; ++i) {
-        jfr_cfg[i].depth = 2048;
+        jfr_cfg[i].depth = jfr_depth;
         jfr_cfg[i].flag.bs.tag_matching = URMA_NO_TAG_MATCHING;
         jfr_cfg[i].flag.bs.lock_free = 0;
-        jfr_cfg[i].trans_mode = URMA_TM_RC;
+        jfr_cfg[i].trans_mode = engine_.rmMode() ? URMA_TM_RM : URMA_TM_RC;
         jfr_cfg[i].min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
         jfr_cfg[i].token_value = urma_token;
         jfr_cfg[i].id = 0;
@@ -163,12 +172,13 @@ int UrmaContext::construct(GlobalConfig& config) {
 
 int UrmaContext::deconstruct() {
     for (auto& entry : seg_region_list_) {
-        int ret = urma_unregister_seg(entry.first);
+        int ret = urma_unregister_seg(entry.seg);
         if (ret) {
             PLOG(ERROR) << "Failed to unregister segment";
         }
     }
     seg_region_list_.clear();
+    local_tseg_list_.clear();
 
     for (auto& seg : imported_seg_list_) {
         int ret = urma_unimport_seg(seg);
@@ -245,34 +255,65 @@ int UrmaContext::deconstruct() {
 
 urma_target_seg_t* UrmaContext::seg(uint64_t addr) {
     RWSpinlock::ReadGuard guard(seg_region_lock_);
-    for (auto iter = seg_region_list_.begin(); iter != seg_region_list_.end();
-         ++iter)
-        if ((*iter).first->seg.ubva.va <= addr &&
-            addr < (*iter).first->seg.ubva.va + (*iter).second)
-            return (*iter).first;
+    for (const auto& entry : seg_region_list_) {
+        if (entry.seg->seg.ubva.va <= addr &&
+            addr < entry.seg->seg.ubva.va + entry.length) {
+            return entry.seg;
+        }
+    }
 
     LOG(ERROR) << "Address " << addr << " seg not found for " << deviceName();
-    return 0;
+    return nullptr;
 }
 
 int UrmaContext::buildLocalBufferDesc(uint64_t addr,
                                       UbTransport::BufferDesc& buffer_desc) {
-    auto str = serializeBinaryData(&seg(addr)->seg, sizeof(urma_seg_t));
-    auto index = local_tseg_list().size() - 1;
+    urma_seg_t seg_copy{};
+    uint32_t index = 0;
+    bool found = false;
+    {
+        RWSpinlock::ReadGuard guard(seg_region_lock_);
+        for (const auto& entry : seg_region_list_) {
+            if (entry.seg->seg.ubva.va <= addr &&
+                addr < entry.seg->seg.ubva.va + entry.length) {
+                seg_copy = entry.seg->seg;
+                index = entry.index;
+                found = true;
+                break;
+            }
+        }
+    }
+    if (!found) {
+        LOG(ERROR) << "Address " << addr << " seg not found for "
+                   << deviceName();
+        return ERR_CONTEXT;
+    }
+    auto str = serializeBinaryData(&seg_copy, sizeof(urma_seg_t));
     buffer_desc.tseg.push_back(str);
     buffer_desc.l_seg_index.push_back(index);
     return 0;
 }
 
 void* UrmaContext::localSegWithIndex(unsigned value) {
-    return local_tseg_list_.at(value);
+    RWSpinlock::ReadGuard guard(seg_region_lock_);
+    if (value >= local_tseg_list_.size()) {
+        return nullptr;
+    }
+    return local_tseg_list_[value];
 }
 
 int UrmaContext::registerMemoryRegion(uint64_t va, size_t length) {
-    if (length > (size_t)globalConfig().max_seg_size) {
-        PLOG(WARNING) << "The buffer length exceeds device max_seg_size, "
-                      << "shrink it to " << globalConfig().max_seg_size;
-        length = (size_t)globalConfig().max_seg_size;
+    if (globalConfig().max_seg_size > 0 &&
+        length > (size_t)globalConfig().max_seg_size) {
+        // #3503: registerLocalMemory auto-chunks buffers to <= max_seg_size, so
+        // no larger buffer should reach here. Fail loudly instead of silently
+        // truncating the segment — a truncated segment advertises bytes past
+        // the registered region.
+        LOG(ERROR) << "Buffer length " << length
+                   << " exceeds device max_seg_size "
+                   << globalConfig().max_seg_size
+                   << " (should have been chunked before registration, #3503)";
+        return ERR_INVALID_ARGUMENT;
     }
     LOG(INFO) << "Register memory region " << va << " length " << length;
     urma_reg_seg_flag_t flag = {};
@@ -297,10 +338,11 @@ int UrmaContext::registerMemoryRegion(uint64_t va, size_t length) {
         return ERR_CONTEXT;
     }
     LOG(INFO) << "Local seg token id : " << seg->seg.token_id;
-    local_tseg_list_.push_back(seg);
 
     RWSpinlock::WriteGuard guard(seg_region_lock_);
-    seg_region_list_.emplace_back(seg, length);
+    uint32_t index = static_cast<uint32_t>(local_tseg_list_.size());
+    local_tseg_list_.push_back(seg);
+    seg_region_list_.push_back({seg, length, index});
     return 0;
 }
 
@@ -311,12 +353,15 @@ int UrmaContext::unregisterMemoryRegion(uint64_t addr) {
         has_removed = false;
         for (auto iter = seg_region_list_.begin();
              iter != seg_region_list_.end(); ++iter) {
-            if ((*iter).first->seg.ubva.va <= addr &&
-                addr < (*iter).first->seg.ubva.va + (*iter).second) {
-                if (urma_unregister_seg((*iter).first)) {
+            if (iter->seg->seg.ubva.va <= addr &&
+                addr < iter->seg->seg.ubva.va + iter->length) {
+                if (urma_unregister_seg(iter->seg)) {
                     LOG(ERROR) << "Failed to unregister memory "
-                               << (*iter).first->seg.ubva.va;
+                               << iter->seg->seg.ubva.va;
                     return ERR_CONTEXT;
+                }
+                if (iter->index < local_tseg_list_.size()) {
+                    local_tseg_list_[iter->index] = nullptr;
                 }
                 seg_region_list_.erase(iter);
                 has_removed = true;
@@ -660,13 +705,17 @@ int UrmaEndpoint::construct(GlobalConfig& config) {
         LOG(ERROR) << "Failed to allocate memory for work request depth list";
         return ERR_MEMORY;
     }
+    const uint32_t jfs_depth =
+        context_->rmMode() ? std::min(context_->dev_attr_.dev_cap.max_jfs_depth,
+                                      (uint32_t)URMA_DEFAULT_JETTY_DEPTH)
+                           : (uint32_t)URMA_DEFAULT_JETTY_DEPTH;
     urma_jfs_cfg_t jfs_cfg = {
-        .depth = 2048,            // DEFAULT_DEPTH (512)
-        .trans_mode = URMA_TM_RC, /* Reliable connection */
-        .priority = 15,           // URMA_MAX_PRIORITY 15
-        .max_sge = 5,             // SGE_NUM_MAX 5
-        .rnr_retry = 7,           // URMA_TYPICAL_RNR_RETRY    7
-        .err_timeout = 17,        // URMA_TYPICAL_ERR_TIMEOUT   17
+        .depth = jfs_depth,
+        .trans_mode = context_->rmMode() ? URMA_TM_RM : URMA_TM_RC,
+        .priority = 15,     // URMA_MAX_PRIORITY 15
+        .max_sge = 5,       // SGE_NUM_MAX 5
+        .rnr_retry = 7,     // URMA_TYPICAL_RNR_RETRY    7
+        .err_timeout = 17,  // URMA_TYPICAL_ERR_TIMEOUT   17
         .user_ctx = 0,
     };
     urma_jetty_flag_t jetty_flag = {};
@@ -702,11 +751,22 @@ int UrmaEndpoint::deconstruct() {
         auto imported_jetty = (imported_it != imported_jetty_map_.end())
                                   ? imported_it->second
                                   : nullptr;
-        ret = urma_unbind_jetty(jetty_list_[i]);
-        if (ret) PLOG(ERROR) << "Failed to unbind jetty";
-        if (imported_jetty != nullptr) {
-            ret = urma_unimport_jetty(imported_jetty);
-            if (ret) PLOG(ERROR) << "Failed to unimport jetty";
+        if (context_->rmMode()) {
+            // RM mode (UBoE): the channel is established by import_jetty
+            // alone, so there is no unbind; just release the imported
+            // remote jetty.
+            if (imported_jetty != nullptr) {
+                ret = urma_unimport_jetty(imported_jetty);
+                if (ret) PLOG(ERROR) << "Failed to unimport jetty";
+                imported_jetty_map_.erase(jetty_list_[i]);
+            }
+        } else {
+            ret = urma_unbind_jetty(jetty_list_[i]);
+            if (ret) PLOG(ERROR) << "Failed to unbind jetty";
+            if (imported_jetty != nullptr) {
+                ret = urma_unimport_jetty(imported_jetty);
+                if (ret) PLOG(ERROR) << "Failed to unimport jetty";
+            }
         }
         ret = urma_delete_jetty(jetty_list_[i]);
         if (ret) PLOG(ERROR) << "Failed to delete jetty";
@@ -821,11 +881,25 @@ void UrmaEndpoint::disconnectUnlocked() {
     for (size_t i = 0; i < jetty_list_.size(); ++i) {
         int ret = urma_modify_jetty(jetty_list_[i], &attr);
         if (ret) PLOG(ERROR) << "Failed to modify jetty to RESET";
-        auto imported_jetty = imported_jetty_map_[jetty_list_[i]];
-        ret = urma_unbind_jetty(jetty_list_[i]);
-        if (ret) PLOG(ERROR) << "Failed to unbind jetty";
-        ret = urma_unimport_jetty(imported_jetty);
-        if (ret) PLOG(ERROR) << "Failed to unimport jetty";
+        auto imported_it = imported_jetty_map_.find(jetty_list_[i]);
+        auto imported_jetty = (imported_it != imported_jetty_map_.end())
+                                  ? imported_it->second
+                                  : nullptr;
+        if (context_->rmMode()) {
+            // RM mode (UBoE): no bind was performed, only unimport.
+            if (imported_jetty != nullptr) {
+                ret = urma_unimport_jetty(imported_jetty);
+                if (ret) PLOG(ERROR) << "Failed to unimport jetty";
+                imported_jetty_map_.erase(jetty_list_[i]);
+            }
+        } else {
+            ret = urma_unbind_jetty(jetty_list_[i]);
+            if (ret) PLOG(ERROR) << "Failed to unbind jetty";
+            if (imported_jetty != nullptr) {
+                ret = urma_unimport_jetty(imported_jetty);
+                if (ret) PLOG(ERROR) << "Failed to unimport jetty";
+            }
+        }
         // After resetting QP, the wr_depth_list_ won't change
         bool displayed = false;
         if (wr_depth_list_[i] != 0) {
@@ -1020,13 +1094,28 @@ int UrmaEndpoint::doSetupConnection(int jetty_index,
     urma_rjetty_t rjetty = {};
     rjetty.jetty_id.id = peer_jetty_num;
     rjetty.jetty_id.eid = eid;
-    rjetty.trans_mode = URMA_TM_RC;
+    rjetty.trans_mode = context_->rmMode() ? URMA_TM_RM : URMA_TM_RC;
     rjetty.type = URMA_JETTY;
     rjetty.tp_type = URMA_CTP;
     rjetty.flag.value = 0;
     LOG(INFO) << "Peer jetty id = " << peer_jetty_num;
     urma_target_jetty_t* imported_jetty =
         urma_import_jetty(context_->urma_context_, &rjetty, &urma_token);
+    if (!imported_jetty) {
+        std::string message = "Failed to import jetty";
+        PLOG(ERROR) << "[Handshake] " << message;
+        if (reply_msg) *reply_msg = message + ": " + strerror(errno);
+        return ERR_ENDPOINT;
+    }
+    if (context_->rmMode()) {
+        // RM mode (UBoE): import_jetty alone establishes the channel;
+        // bind_jetty is only supported under URMA_TM_RC.
+        imported_jetty_map_[jetty] = imported_jetty;
+        LOG(INFO) << "Import jetty success (RM mode), local jetty id:"
+                  << jetty->jetty_id.id
+                  << ", remote jetty id:" << peer_jetty_num;
+        return 0;
+    }
     urma_status_t ret = urma_bind_jetty(jetty, imported_jetty);
     if (ret != URMA_SUCCESS && ret != URMA_EEXIST) {
         std::string message = "Failed to bind jetty";
